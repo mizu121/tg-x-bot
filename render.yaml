@@ -29,7 +29,9 @@ services:
       - key: DOWNLOAD_MAX_TOTAL_MB
         value: "600"
       - key: PROGRESS_INTERVAL_SECONDS
-        value: "1.5"
+        value: "0.9"
+      - key: PROGRESS_FRAMES
+        value: ">>>>>-----"
       - key: DOWNLOAD_DIR
         value: "/var/data/downloads"
       - key: FAILURE_LOG_PATH

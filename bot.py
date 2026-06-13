@@ -86,8 +86,8 @@ MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
 MAX_REELS_PER_REQUEST = int(os.getenv("MAX_REELS_PER_REQUEST", "5"))
 DOWNLOAD_TTL_MINUTES = int(os.getenv("DOWNLOAD_TTL_MINUTES", "90"))
 DOWNLOAD_MAX_TOTAL_MB = int(os.getenv("DOWNLOAD_MAX_TOTAL_MB", "600"))
-PROGRESS_INTERVAL_SECONDS = float(os.getenv("PROGRESS_INTERVAL_SECONDS", "2.5"))
-PROGRESS_FRAMES = tuple(os.getenv("PROGRESS_FRAMES", "|/-\\"))
+PROGRESS_INTERVAL_SECONDS = float(os.getenv("PROGRESS_INTERVAL_SECONDS", "0.9"))
+PROGRESS_FRAMES = tuple(os.getenv("PROGRESS_FRAMES", ">>>>>-----"))
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "90"))
 YTDLP_FORMAT = os.getenv(
     "YTDLP_FORMAT",
@@ -181,6 +181,15 @@ class DownloadResult:
 
 
 class ProgressMessage:
+    STAGES = [
+        ("READ", ("reading request", "booting")),
+        ("FETCH", ("reading instagram", "fetching", "analyzing", "found")),
+        ("DL", ("downloading",)),
+        ("CONV", ("converting", "normalizing")),
+        ("UPLOAD", ("uploading",)),
+        ("DONE", ("done", "sent")),
+    ]
+
     def __init__(self, message, initial_step: str, cleanup_messages: list | None = None) -> None:
         self.message = message
         self.step = initial_step
@@ -190,6 +199,7 @@ class ProgressMessage:
         self.task: asyncio.Task | None = None
         self.last_text: tuple[str | None, str] | None = None
         self.cleanup_messages = cleanup_messages or []
+        self.display_percent = 0
 
     async def start(self) -> None:
         await self._edit(self._render(), parse_mode="HTML")
@@ -255,37 +265,33 @@ class ProgressMessage:
             logger.debug("Progress edit failed: %s", exc)
 
     def _render(self) -> str:
-        elapsed = max(1, int(time.time() - self.started_at))
-        frame = PROGRESS_FRAMES[elapsed % len(PROGRESS_FRAMES)] if PROGRESS_FRAMES else "*"
-        width = 12
-        cursor = elapsed % width
+        elapsed_raw = max(0.1, time.time() - self.started_at)
+        elapsed = max(1, int(elapsed_raw))
+        tick = int(elapsed_raw / max(0.25, PROGRESS_INTERVAL_SECONDS))
+        frame = PROGRESS_FRAMES[tick % len(PROGRESS_FRAMES)] if PROGRESS_FRAMES else ">"
+        width = 16
+        cursor = (tick * 2) % width
         bar = ["▱"] * width
-        for offset in range(4):
+        for offset in range(6):
             bar[(cursor - offset) % width] = "▰"
+        percent = self._display_percent(elapsed_raw)
+        bar = self._fill_bar(bar, percent)
         minutes, seconds = divmod(elapsed, 60)
         stage_line = "  ".join(self._stage_tokens())
         trace = " → ".join(self._clip(step, 18) for step in self.history[-3:])
         lines = [
             f"<b>{html.escape(self._clip(self.step, 42))}</b>",
-            f"<code>{''.join(bar)}</code>  {minutes:02d}:{seconds:02d}  {html.escape(frame)}",
+            f"<code>{html.escape(frame)} {''.join(bar)} {percent:02d}%</code>  {minutes:02d}:{seconds:02d}",
             html.escape(stage_line),
             f"<i>{html.escape(trace)}</i>",
         ]
         return "\n".join(lines)
 
     def _stage_tokens(self) -> list[str]:
-        stages = [
-            ("READ", ("reading request", "booting")),
-            ("FETCH", ("reading instagram", "fetching", "analyzing", "found")),
-            ("DL", ("downloading",)),
-            ("CONV", ("converting", "normalizing")),
-            ("UPLOAD", ("uploading",)),
-            ("DONE", ("done", "sent")),
-        ]
         current = self.step.lower()
         history = " ".join(self.history).lower()
         tokens = []
-        for label, needles in stages:
+        for label, needles in self.STAGES:
             if any(needle in current for needle in needles):
                 state = "●"
             elif any(needle in history for needle in needles):
@@ -294,6 +300,33 @@ class ProgressMessage:
                 state = "·"
             tokens.append(f"{label} {state}")
         return tokens
+
+    def _stage_index(self) -> int:
+        current = self.step.lower()
+        history = " ".join(self.history).lower()
+        fallback = 0
+        for index, (_, needles) in enumerate(self.STAGES):
+            if any(needle in current for needle in needles):
+                return index
+            if any(needle in history for needle in needles):
+                fallback = index
+        return fallback
+
+    def _display_percent(self, elapsed: float) -> int:
+        index = min(self._stage_index(), len(self.STAGES) - 2)
+        stage_floor = [3, 16, 38, 62, 82][index]
+        stage_ceiling = [18, 42, 68, 86, 96][index]
+        pulse = min(stage_ceiling - stage_floor, int(elapsed * 7) % (stage_ceiling - stage_floor + 1))
+        candidate = min(96, stage_floor + pulse)
+        self.display_percent = min(96, max(self.display_percent, candidate))
+        return self.display_percent
+
+    @staticmethod
+    def _fill_bar(bar: list[str], percent: int) -> list[str]:
+        fill_count = min(len(bar), max(0, round(len(bar) * percent / 100)))
+        for index in range(fill_count):
+            bar[index] = "▰"
+        return bar
 
     @staticmethod
     def _clip(value: str, limit: int) -> str:
