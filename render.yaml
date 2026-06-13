@@ -40,3 +40,9 @@ services:
         value: "false"
       - key: LOG_TRACEBACKS
         value: "false"
+      - key: YOUTUBE_CLIENTS
+        value: "mweb,web_safari,android,web"
+      - key: YOUTUBE_FALLBACK_CLIENTS
+        value: "android,web;web_safari;tv;ios"
+      - key: YOUTUBE_PO_PROVIDER
+        value: "none"

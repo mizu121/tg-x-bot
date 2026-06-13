@@ -25,9 +25,20 @@ The bot defaults are intentionally conservative:
 - `DOWNLOAD_TTL_MINUTES=90` and `DOWNLOAD_MAX_TOTAL_MB=600` remove stale local media automatically.
 - `APIFY_MAX_CHARGE_USD=0.05` can cap the cost of one Instagram actor run.
 - `YTDLP_FORMAT` caps default downloads at 720p to reduce bandwidth, disk, and CPU while still allowing fallbacks.
+- `YOUTUBE_CLIENTS` and `YOUTUBE_FALLBACK_CLIENTS` try multiple yt-dlp YouTube clients before giving up.
 - Completed downloads are stored in a per-request temp folder and deleted after sending.
 - Failed requests are written to `FAILURE_LOG_PATH` as JSONL and to stdout for host logs.
 - `LOG_FULL_URLS=false` keeps failure logs sanitized by default.
+
+## YouTube notes
+
+YouTube sometimes blocks cloud-hosted downloaders with "Sign in to confirm you're not a bot." Keep `yt-dlp` current first, then use these options only when needed:
+
+- `YTDLP_COOKIES_B64` can hold a base64-encoded Netscape cookie file in host secrets. This is cheap, but cookies expire and should not be committed.
+- `YOUTUBE_PO_PROVIDER=http` enables the installed bgutil PO-token plugin when a bgutil HTTP provider is reachable. Set `YOUTUBE_BGUTIL_BASE_URL` if it is not on the default local port.
+- `YOUTUBE_PO_PROVIDER=script` enables bgutil script mode when the provider files and Node.js/Deno are installed. Set `YOUTUBE_BGUTIL_SERVER_HOME`.
+
+Paid download APIs are usually wrappers around the same moving target, so they are the last resort rather than the first fix.
 
 ## Bot commands
 

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import mimetypes
@@ -35,6 +36,36 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+
+def _prepare_cookie_file() -> str | None:
+    cookie_file = os.getenv("YTDLP_COOKIE_FILE")
+    cookie_blob = os.getenv("YTDLP_COOKIES_B64")
+    if not cookie_blob:
+        return cookie_file
+
+    target = Path(os.getenv("YTDLP_GENERATED_COOKIE_FILE", "/tmp/ytdlp_cookies.txt"))
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(base64.b64decode(cookie_blob))
+        target.chmod(0o600)
+        return str(target)
+    except Exception as exc:
+        logger.warning("Could not prepare yt-dlp cookie file: %s", exc)
+        return cookie_file
+
+
+def _csv_values(value: str | None) -> list[str]:
+    return [part.strip() for part in (value or "").split(",") if part.strip()]
+
+
+def _youtube_client_groups(value: str | None) -> list[list[str]]:
+    groups = []
+    for group in (value or "").split(";"):
+        clients = _csv_values(group)
+        if clients:
+            groups.append(clients)
+    return groups
+
 STARTED_AT = time.time()
 DOWNLOAD_ROOT = Path(os.getenv("DOWNLOAD_DIR", "downloads"))
 FAILURE_LOG_PATH = Path(os.getenv("FAILURE_LOG_PATH", "logs/failures.jsonl"))
@@ -57,7 +88,14 @@ YTDLP_FORMAT = os.getenv(
     "YTDLP_FORMAT",
     "bv*[height<=720]+ba/b[height<=720]/best[height<=720]/best",
 )
-YTDLP_COOKIE_FILE = os.getenv("YTDLP_COOKIE_FILE")
+YTDLP_COOKIE_FILE = _prepare_cookie_file()
+YOUTUBE_CLIENTS = _csv_values(os.getenv("YOUTUBE_CLIENTS", "mweb,web_safari,android,web"))
+YOUTUBE_FALLBACK_CLIENTS = _youtube_client_groups(
+    os.getenv("YOUTUBE_FALLBACK_CLIENTS", "android,web;web_safari;tv;ios")
+)
+YOUTUBE_PO_PROVIDER = os.getenv("YOUTUBE_PO_PROVIDER", "none").strip().lower()
+YOUTUBE_BGUTIL_BASE_URL = os.getenv("YOUTUBE_BGUTIL_BASE_URL", "").strip()
+YOUTUBE_BGUTIL_SERVER_HOME = os.getenv("YOUTUBE_BGUTIL_SERVER_HOME", "").strip()
 APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 APIFY_INSTAGRAM_ACTOR = os.getenv("APIFY_INSTAGRAM_ACTOR", "apify/instagram-scraper")
 APIFY_MAX_CHARGE_USD = os.getenv("APIFY_MAX_CHARGE_USD")
@@ -215,6 +253,17 @@ def _trim_error(value: str, limit: int = 900) -> str:
     return f"{compact[: limit - 15].rstrip()}...[truncated]"
 
 
+class YtdlpLogBridge:
+    def debug(self, msg: str) -> None:
+        return
+
+    def warning(self, msg: str) -> None:
+        logger.debug("yt-dlp warning: %s", _trim_error(msg))
+
+    def error(self, msg: str) -> None:
+        logger.debug("yt-dlp error: %s", _trim_error(msg))
+
+
 def _failure_record(update: Update, request_text: str, exc: BaseException, stage: str) -> dict:
     url = _request_url(request_text)
     record = {
@@ -294,7 +343,25 @@ def _trim_caption(text: str, limit: int = 3900) -> str:
     return f"{cleaned[: limit - 20].rstrip()}\n\n...[truncated]"
 
 
-def _build_ydl_opts(job_dir: Path) -> dict:
+def _youtube_extractor_args(clients: list[str] | None = None) -> dict:
+    args = {
+        "instagram": {"direct": True},
+        "youtube": {"player_client": clients or YOUTUBE_CLIENTS},
+    }
+
+    if YOUTUBE_PO_PROVIDER == "http":
+        args["youtubepot-bgutilhttp"] = {}
+        if YOUTUBE_BGUTIL_BASE_URL:
+            args["youtubepot-bgutilhttp"]["base_url"] = YOUTUBE_BGUTIL_BASE_URL
+    elif YOUTUBE_PO_PROVIDER == "script":
+        args["youtubepot-bgutilscript"] = {}
+        if YOUTUBE_BGUTIL_SERVER_HOME:
+            args["youtubepot-bgutilscript"]["server_home"] = YOUTUBE_BGUTIL_SERVER_HOME
+
+    return args
+
+
+def _build_ydl_opts(job_dir: Path, youtube_clients: list[str] | None = None) -> dict:
     opts = {
         "format": YTDLP_FORMAT,
         "format_sort": ["res:720", "ext:mp4:m4a"],
@@ -307,6 +374,7 @@ def _build_ydl_opts(job_dir: Path) -> dict:
         "cachedir": False,
         "quiet": True,
         "no_warnings": True,
+        "logger": YtdlpLogBridge(),
         "retries": 3,
         "fragment_retries": 3,
         "socket_timeout": 30,
@@ -316,16 +384,42 @@ def _build_ydl_opts(job_dir: Path) -> dict:
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
             )
         },
-        "extractor_args": {
-            "instagram": {"direct": True},
-            "youtube": {"player_client": ["android", "web"]},
-        },
+        "extractor_args": _youtube_extractor_args(youtube_clients),
     }
 
     if YTDLP_COOKIE_FILE:
         opts["cookiefile"] = YTDLP_COOKIE_FILE
 
     return opts
+
+
+def _is_youtube_url(url: str) -> bool:
+    host = _hostname(url)
+    return host in {"youtube.com", "m.youtube.com", "youtu.be", "music.youtube.com"} or host.endswith(".youtube.com")
+
+
+def _youtube_error_allows_fallback(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return any(
+        needle in message
+        for needle in (
+            "sign in to confirm",
+            "not a bot",
+            "http error 403",
+            "forbidden",
+            "po token",
+            "video unavailable",
+            "requested format is not available",
+        )
+    )
+
+
+def _youtube_client_attempts() -> list[list[str]]:
+    attempts = []
+    for clients in [YOUTUBE_CLIENTS, *YOUTUBE_FALLBACK_CLIENTS]:
+        if clients and clients not in attempts:
+            attempts.append(clients)
+    return attempts
 
 
 def _caption_from_info(info: dict, file_path: Path) -> str:
@@ -451,11 +545,14 @@ def _download_direct_media(url: str, job_dir: Path, caption: str, kind: str) -> 
     return DownloadResult(file_path=file_path, caption=caption, kind=kind, title=caption, source=_hostname(url))
 
 
-def download_video(url: str, job_dir: Path, caption: str | None = None) -> DownloadResult:
-    if "scontent" in url or "cdninstagram" in url:
-        return _download_direct_media(url, job_dir, caption or "Video", "video")
-
-    with yt_dlp.YoutubeDL(_build_ydl_opts(job_dir)) as ydl:
+def _download_with_ydlp(
+    url: str,
+    job_dir: Path,
+    caption: str | None = None,
+    youtube_clients: list[str] | None = None,
+) -> DownloadResult:
+    job_dir.mkdir(parents=True, exist_ok=True)
+    with yt_dlp.YoutubeDL(_build_ydl_opts(job_dir, youtube_clients)) as ydl:
         info = ydl.extract_info(url, download=True)
         if not isinstance(info, dict):
             raise ValueError("Could not read video metadata.")
@@ -474,6 +571,30 @@ def download_video(url: str, job_dir: Path, caption: str | None = None) -> Downl
             height=info.get("height"),
             source=info.get("extractor_key") or _hostname(url),
         )
+
+
+def download_video(url: str, job_dir: Path, caption: str | None = None) -> DownloadResult:
+    if "scontent" in url or "cdninstagram" in url:
+        return _download_direct_media(url, job_dir, caption or "Video", "video")
+
+    if not _is_youtube_url(url):
+        return _download_with_ydlp(url, job_dir, caption)
+
+    last_error: yt_dlp.utils.DownloadError | None = None
+    for index, clients in enumerate(_youtube_client_attempts(), start=1):
+        attempt_dir = job_dir / f"youtube-attempt-{index}"
+        try:
+            if index > 1:
+                logger.info("Retrying YouTube download with clients=%s", ",".join(clients))
+            return _download_with_ydlp(url, attempt_dir, caption, clients)
+        except yt_dlp.utils.DownloadError as exc:
+            last_error = exc
+            if not _youtube_error_allows_fallback(exc):
+                raise
+
+    if last_error:
+        raise last_error
+    return _download_with_ydlp(url, job_dir, caption)
 
 
 def download_media_item(item: MediaItem, job_dir: Path) -> DownloadResult:
@@ -826,6 +947,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Max reels/request: {MAX_REELS_PER_REQUEST}",
         f"Apify: {'configured' if APIFY_TOKEN else 'not configured'}",
         f"yt-dlp cookies: {'configured' if YTDLP_COOKIE_FILE else 'not configured'}",
+        f"YouTube clients: {','.join(YOUTUBE_CLIENTS)}",
+        f"YouTube PO provider: {YOUTUBE_PO_PROVIDER}",
         f"Failure log: {FAILURE_LOG_PATH}",
         f"Admin commands: {'configured' if ADMIN_CHAT_IDS else 'not configured'}",
         f"Your chat id: {_chat_id(update)}",
