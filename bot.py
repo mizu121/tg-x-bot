@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import mimetypes
 import os
@@ -6,11 +7,13 @@ import re
 import shutil
 import tempfile
 import time
+import traceback
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
 import yt_dlp
@@ -34,6 +37,12 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 STARTED_AT = time.time()
 DOWNLOAD_ROOT = Path(os.getenv("DOWNLOAD_DIR", "downloads"))
+FAILURE_LOG_PATH = Path(os.getenv("FAILURE_LOG_PATH", "logs/failures.jsonl"))
+FAILURE_LOG_MAX_ENTRIES = int(os.getenv("FAILURE_LOG_MAX_ENTRIES", "100"))
+LOG_FULL_URLS = os.getenv("LOG_FULL_URLS", "false").lower() == "true"
+ADMIN_CHAT_IDS = {
+    value.strip() for value in os.getenv("ADMIN_CHAT_IDS", "").split(",") if value.strip()
+}
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "49"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 SEND_AS_DOCUMENT_MB = int(os.getenv("SEND_AS_DOCUMENT_MB", "45"))
@@ -60,6 +69,7 @@ REELS_RE = re.compile(r"^!reels\s+(?P<username>[A-Za-z0-9_.]+)(?:\s+(?P<count>\d
 VIDEO_URL_KEYS = ("videoUrl", "videoUrlDownload", "video_url", "video", "downloadUrl")
 PHOTO_URL_KEYS = ("displayUrl", "imageUrl", "image_url", "image", "photoUrl", "thumbnailUrl")
 CHILD_POST_KEYS = ("childPosts", "children", "carouselMedia", "sidecarChildren", "media")
+SAFE_QUERY_KEYS = {"v", "list", "t", "start", "end"}
 
 download_slots = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
@@ -147,6 +157,114 @@ class ProgressMessage:
 def _hostname(url: str) -> str:
     host = urlparse(url).netloc.lower()
     return host[4:] if host.startswith("www.") else host
+
+
+def _now_iso() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _chat_id(update: Update) -> str | None:
+    if update.effective_chat:
+        return str(update.effective_chat.id)
+    if update.message:
+        return str(update.message.chat_id)
+    return None
+
+
+def _user_id(update: Update) -> str | None:
+    if update.effective_user:
+        return str(update.effective_user.id)
+    return None
+
+
+def _is_admin(update: Update) -> bool:
+    if not ADMIN_CHAT_IDS:
+        return False
+    ids = {_chat_id(update), _user_id(update)}
+    return bool(ADMIN_CHAT_IDS.intersection(value for value in ids if value))
+
+
+def _sanitize_url(url: str) -> str:
+    if LOG_FULL_URLS:
+        return url
+    parsed = urlparse(url)
+    safe_query = [(key, value) for key, value in parse_qsl(parsed.query) if key in SAFE_QUERY_KEYS]
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", urlencode(safe_query), ""))
+
+
+def _request_url(text: str) -> str | None:
+    match = URL_RE.search(text or "")
+    if not match:
+        return None
+    return match.group(0).rstrip(".,)")
+
+
+def _platform_from_text(text: str) -> str:
+    url = _request_url(text)
+    if url:
+        return _hostname(url)
+    if text.strip().startswith("@") or text.strip().lower().startswith("!reels"):
+        return "instagram-reels"
+    return "unknown"
+
+
+def _trim_error(value: str, limit: int = 900) -> str:
+    compact = " ".join(value.split())
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[: limit - 15].rstrip()}...[truncated]"
+
+
+def _failure_record(update: Update, request_text: str, exc: BaseException, stage: str) -> dict:
+    url = _request_url(request_text)
+    record = {
+        "ts": _now_iso(),
+        "stage": stage,
+        "platform": _platform_from_text(request_text),
+        "chat_id": _chat_id(update),
+        "user_id": _user_id(update),
+        "request": _sanitize_url(url) if url else request_text.strip()[:160],
+        "error_type": type(exc).__name__,
+        "error": _trim_error(str(exc) or repr(exc)),
+    }
+    if os.getenv("LOG_TRACEBACKS", "false").lower() == "true":
+        record["traceback"] = _trim_error("".join(traceback.format_exception(exc)), limit=3000)
+    return record
+
+
+def record_failure(update: Update, request_text: str, exc: BaseException, stage: str) -> None:
+    record = _failure_record(update, request_text, exc, stage)
+    logger.warning("media_request_failed %s", json.dumps(record, sort_keys=True))
+
+    try:
+        FAILURE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with FAILURE_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
+        trim_failure_log()
+    except OSError as log_error:
+        logger.warning("Could not write failure log: %s", log_error)
+
+
+def trim_failure_log() -> None:
+    if FAILURE_LOG_MAX_ENTRIES <= 0 or not FAILURE_LOG_PATH.exists():
+        return
+    lines = FAILURE_LOG_PATH.read_text(encoding="utf-8").splitlines()
+    if len(lines) <= FAILURE_LOG_MAX_ENTRIES:
+        return
+    FAILURE_LOG_PATH.write_text("\n".join(lines[-FAILURE_LOG_MAX_ENTRIES:]) + "\n", encoding="utf-8")
+
+
+def read_failures(limit: int = 5) -> list[dict]:
+    if not FAILURE_LOG_PATH.exists():
+        return []
+    lines = FAILURE_LOG_PATH.read_text(encoding="utf-8").splitlines()[-limit:]
+    failures = []
+    for line in lines:
+        try:
+            failures.append(json.loads(line))
+        except json.JSONDecodeError:
+            failures.append({"ts": "unknown", "error": line[:240]})
+    return failures
 
 
 def _format_bytes(size: int) -> str:
@@ -663,13 +781,16 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await process_and_send_url(update, context, url, progress)
             await progress.finish("Done.")
     except DownloadTooLargeError as exc:
+        record_failure(update, text, exc, "download_size")
         await progress.finish(f"File is too large for this bot config: {exc}")
     except MissingConfigError as exc:
+        record_failure(update, text, exc, "config")
         await progress.finish(str(exc))
     except yt_dlp.utils.DownloadError as exc:
-        logger.warning("yt-dlp failed for %s: %s", text, exc)
+        record_failure(update, text, exc, "yt_dlp")
         await progress.finish("Could not download that link. It may be private, blocked, age-gated, or need cookies.")
-    except Exception:
+    except Exception as exc:
+        record_failure(update, text, exc, "unexpected")
         logger.exception("Unexpected error while handling request")
         await progress.finish("Something went wrong while downloading that media.")
 
@@ -705,8 +826,52 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Max reels/request: {MAX_REELS_PER_REQUEST}",
         f"Apify: {'configured' if APIFY_TOKEN else 'not configured'}",
         f"yt-dlp cookies: {'configured' if YTDLP_COOKIE_FILE else 'not configured'}",
+        f"Failure log: {FAILURE_LOG_PATH}",
+        f"Admin commands: {'configured' if ADMIN_CHAT_IDS else 'not configured'}",
+        f"Your chat id: {_chat_id(update)}",
     ]
     await update.message.reply_text("\n".join(lines))
+
+
+async def failures(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not _is_admin(update):
+        await update.message.reply_text(
+            f"Set ADMIN_CHAT_IDS={_chat_id(update)} in the host env to enable failure-log access."
+        )
+        return
+
+    limit = 5
+    if context.args:
+        try:
+            limit = max(1, min(20, int(context.args[0])))
+        except ValueError:
+            limit = 5
+
+    entries = read_failures(limit)
+    if not entries:
+        await update.message.reply_text("No failures logged yet.")
+        return
+
+    lines = [f"Last {len(entries)} failure(s)"]
+    for entry in entries:
+        lines.append(
+            "\n".join(
+                [
+                    f"{entry.get('ts', 'unknown')} | {entry.get('platform', 'unknown')} | {entry.get('stage', 'unknown')}",
+                    f"Request: {entry.get('request', 'unknown')}",
+                    f"{entry.get('error_type', 'Error')}: {entry.get('error', '')}",
+                ]
+            )
+        )
+    await update.message.reply_text(_trim_caption("\n\n".join(lines), limit=3900))
+
+
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    await update.message.reply_text(f"Chat ID: {_chat_id(update)}\nUser ID: {_user_id(update)}")
 
 
 def main() -> None:
@@ -720,6 +885,8 @@ def main() -> None:
     application = Application.builder().token(token).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("failures", failures))
+    application.add_handler(CommandHandler("whoami", whoami))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     application.run_polling(drop_pending_updates=True)
 

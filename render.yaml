@@ -3,10 +3,17 @@ services:
     name: tg-x-bot
     runtime: docker
     plan: starter
+    maxShutdownDelaySeconds: 120
+    disk:
+      name: bot-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: BOT_TOKEN
         sync: false
       - key: APIFY_TOKEN
+        sync: false
+      - key: ADMIN_CHAT_IDS
         sync: false
       - key: APIFY_MAX_CHARGE_USD
         value: "0.05"
@@ -24,3 +31,13 @@ services:
         value: "600"
       - key: PROGRESS_INTERVAL_SECONDS
         value: "2.5"
+      - key: DOWNLOAD_DIR
+        value: "/var/data/downloads"
+      - key: FAILURE_LOG_PATH
+        value: "/var/data/logs/failures.jsonl"
+      - key: FAILURE_LOG_MAX_ENTRIES
+        value: "200"
+      - key: LOG_FULL_URLS
+        value: "false"
+      - key: LOG_TRACEBACKS
+        value: "false"

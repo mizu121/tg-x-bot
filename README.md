@@ -10,6 +10,7 @@ Copy `.env.example` to `.env` locally or set the same variables in your host:
 BOT_TOKEN=your_telegram_bot_token
 APIFY_TOKEN=optional_apify_token_for_instagram_reels
 APIFY_MAX_CHARGE_USD=0.05
+ADMIN_CHAT_IDS=your_telegram_chat_id_for_failure_logs
 ```
 
 Do not commit `.env`, cookie files, Telegram tokens, Apify tokens, or Instagram session cookies.
@@ -25,11 +26,15 @@ The bot defaults are intentionally conservative:
 - `APIFY_MAX_CHARGE_USD=0.05` can cap the cost of one Instagram actor run.
 - `YTDLP_FORMAT` caps default downloads at 720p to reduce bandwidth, disk, and CPU while still allowing fallbacks.
 - Completed downloads are stored in a per-request temp folder and deleted after sending.
+- Failed requests are written to `FAILURE_LOG_PATH` as JSONL and to stdout for host logs.
+- `LOG_FULL_URLS=false` keeps failure logs sanitized by default.
 
 ## Bot commands
 
 - `/start` shows basic usage.
 - `/status` shows uptime, disk, cleanup, and config limits without exposing tokens.
+- `/whoami` shows your Telegram chat/user ID for `ADMIN_CHAT_IDS`.
+- `/failures 10` shows recent failure logs for admins.
 
 ## Local run
 
@@ -65,4 +70,4 @@ sudo systemctl enable --now tg-x-bot
 
 ## Render deploy
 
-Use `render.yaml` as a Blueprint. Create a Background Worker, set `BOT_TOKEN` and optional `APIFY_TOKEN`, and keep the worker count at one to avoid duplicate Telegram polling.
+Use `render.yaml` as a Blueprint. Create a Background Worker, set `BOT_TOKEN`, `ADMIN_CHAT_IDS`, and optional `APIFY_TOKEN`, and keep the worker count at one to avoid duplicate Telegram polling. The Blueprint mounts a small persistent disk at `/var/data` for failure logs and temp download cleanup.
