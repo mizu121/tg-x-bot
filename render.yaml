@@ -16,3 +16,9 @@ services:
         value: "45"
       - key: MAX_REELS_PER_REQUEST
         value: "5"
+      - key: DOWNLOAD_TTL_MINUTES
+        value: "90"
+      - key: DOWNLOAD_MAX_TOTAL_MB
+        value: "600"
+      - key: PROGRESS_INTERVAL_SECONDS
+        value: "2.5"

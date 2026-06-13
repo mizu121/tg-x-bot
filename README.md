@@ -20,8 +20,14 @@ The bot defaults are intentionally conservative:
 - `MAX_CONCURRENT_DOWNLOADS=1` prevents multiple large downloads from filling a small server.
 - `MAX_UPLOAD_MB=49` avoids downloading files that Telegram is unlikely to accept.
 - `MAX_REELS_PER_REQUEST=5` keeps Apify usage bounded.
-- `YTDLP_FORMAT` caps default downloads at 720p to reduce bandwidth, disk, and CPU.
+- `DOWNLOAD_TTL_MINUTES=90` and `DOWNLOAD_MAX_TOTAL_MB=600` remove stale local media automatically.
+- `YTDLP_FORMAT` caps default downloads at 720p to reduce bandwidth, disk, and CPU while still allowing fallbacks.
 - Completed downloads are stored in a per-request temp folder and deleted after sending.
+
+## Bot commands
+
+- `/start` shows basic usage.
+- `/status` shows uptime, disk, cleanup, and config limits without exposing tokens.
 
 ## Local run
 
