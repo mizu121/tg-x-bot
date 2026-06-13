@@ -28,6 +28,7 @@ The bot defaults are intentionally conservative:
 - `YOUTUBE_CLIENTS` and `YOUTUBE_FALLBACK_CLIENTS` try multiple yt-dlp YouTube clients before giving up.
 - Instagram carousel posts are downloaded as one batch and sent as Telegram albums when the media fits Telegram's album/upload rules.
 - Progress messages use a monospaced terminal-style live panel and are edited in place.
+- `TELEGRAM_MESSAGE_EFFECT_ID` can attach a Telegram message effect in private chats when you provide a valid effect ID.
 - Completed downloads are stored in a per-request temp folder and deleted after sending.
 - Failed requests are written to `FAILURE_LOG_PATH` as JSONL and to stdout for host logs.
 - `LOG_FULL_URLS=false` keeps failure logs sanitized by default.
