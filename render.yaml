@@ -44,6 +44,18 @@ services:
         value: "false"
       - key: LOG_TRACEBACKS
         value: "false"
+      - key: TELEGRAM_SAFE_VIDEO_TRANSCODE
+        value: "true"
+      - key: VIDEO_TRANSCODE_CRF
+        value: "24"
+      - key: VIDEO_TRANSCODE_PRESET
+        value: "veryfast"
+      - key: VIDEO_TRANSCODE_MAX_WIDTH
+        value: "1080"
+      - key: VIDEO_TRANSCODE_MAX_HEIGHT
+        value: "1920"
+      - key: VIDEO_TRANSCODE_TIMEOUT_SECONDS
+        value: "240"
       - key: YOUTUBE_CLIENTS
         value: "mweb,web_safari,android,web"
       - key: YOUTUBE_FALLBACK_CLIENTS

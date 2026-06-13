@@ -27,6 +27,7 @@ The bot defaults are intentionally conservative:
 - `YTDLP_FORMAT` caps default downloads at 720p to reduce bandwidth, disk, and CPU while still allowing fallbacks.
 - `YOUTUBE_CLIENTS` and `YOUTUBE_FALLBACK_CLIENTS` try multiple yt-dlp YouTube clients before giving up.
 - Instagram carousel posts are downloaded as one batch and sent as Telegram albums when the media fits Telegram's album/upload rules.
+- `TELEGRAM_SAFE_VIDEO_TRANSCODE=true` converts VP9/HEVC/odd Instagram MP4s to Telegram-safe H.264/AAC MP4 before upload.
 - Progress messages use a compact live status card and are edited in place.
 - `TELEGRAM_MESSAGE_EFFECT_ID` can attach a Telegram message effect in private chats when you provide a valid effect ID.
 - `LOADER_STICKER_FILE_ID` or `LOADER_ANIMATION_FILE_ID` can show a Telegram-native animated loader during jobs.
@@ -53,7 +54,7 @@ Paid download APIs are usually wrappers around the same moving target, so they a
 - `/failures 10` shows recent failure logs for admins.
 - `/failures clear` clears stale failure logs for admins.
 - `/clean 30` removes recent bot-sent messages that are still deletable.
-- `/fileid` replies with a file ID when used as a reply to a sticker, GIF, photo, video, or file.
+- `/loaderid` replies with a file ID when used as a reply to a sticker, GIF, photo, video, or file. `/fileid` and `/id` also work.
 - `/demo` previews the live progress status without downloading media.
 
 ## Local run

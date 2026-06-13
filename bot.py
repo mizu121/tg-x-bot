@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 import traceback
@@ -106,6 +107,12 @@ APIFY_MAX_CHARGE_USD = os.getenv("APIFY_MAX_CHARGE_USD")
 TELEGRAM_MESSAGE_EFFECT_ID = os.getenv("TELEGRAM_MESSAGE_EFFECT_ID", "").strip()
 LOADER_STICKER_FILE_ID = os.getenv("LOADER_STICKER_FILE_ID", "").strip()
 LOADER_ANIMATION_FILE_ID = os.getenv("LOADER_ANIMATION_FILE_ID", "").strip()
+TELEGRAM_SAFE_VIDEO_TRANSCODE = os.getenv("TELEGRAM_SAFE_VIDEO_TRANSCODE", "true").lower() != "false"
+VIDEO_TRANSCODE_CRF = int(os.getenv("VIDEO_TRANSCODE_CRF", "24"))
+VIDEO_TRANSCODE_PRESET = os.getenv("VIDEO_TRANSCODE_PRESET", "veryfast")
+VIDEO_TRANSCODE_MAX_WIDTH = int(os.getenv("VIDEO_TRANSCODE_MAX_WIDTH", "1080"))
+VIDEO_TRANSCODE_MAX_HEIGHT = int(os.getenv("VIDEO_TRANSCODE_MAX_HEIGHT", "1920"))
+VIDEO_TRANSCODE_TIMEOUT_SECONDS = int(os.getenv("VIDEO_TRANSCODE_TIMEOUT_SECONDS", "240"))
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 USERNAME_RE = re.compile(r"^@(?P<username>[A-Za-z0-9_.]+)(?:\s+(?P<count>\d+))?$")
@@ -715,6 +722,170 @@ def _check_size(file_path: Path) -> None:
         )
 
 
+def _probe_media(file_path: Path) -> dict | None:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+
+    try:
+        completed = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_format",
+                "-show_streams",
+                "-print_format",
+                "json",
+                str(file_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        return json.loads(completed.stdout)
+    except (json.JSONDecodeError, subprocess.SubprocessError) as exc:
+        logger.info("Could not probe media %s: %s", file_path.name, exc)
+        return None
+
+
+def _first_stream(metadata: dict | None, codec_type: str) -> dict | None:
+    for stream in (metadata or {}).get("streams", []):
+        if stream.get("codec_type") == codec_type:
+            return stream
+    return None
+
+
+def _streams(metadata: dict | None, codec_type: str) -> list[dict]:
+    return [
+        stream
+        for stream in (metadata or {}).get("streams", [])
+        if stream.get("codec_type") == codec_type
+    ]
+
+
+def _video_needs_transcode(file_path: Path, metadata: dict | None = None) -> bool:
+    if not TELEGRAM_SAFE_VIDEO_TRANSCODE:
+        return False
+
+    metadata = metadata or _probe_media(file_path)
+    if not metadata:
+        return False
+
+    video = _first_stream(metadata, "video")
+    if not video:
+        return False
+
+    format_name = str((metadata.get("format") or {}).get("format_name") or "")
+    if file_path.suffix.lower() not in {".mp4", ".m4v", ".mov"} or "mp4" not in format_name:
+        return True
+    if video.get("codec_name") != "h264":
+        return True
+    if video.get("pix_fmt") not in {"yuv420p", "yuvj420p"}:
+        return True
+    return any(stream.get("codec_name") != "aac" for stream in _streams(metadata, "audio"))
+
+
+def _transcode_video_for_telegram(file_path: Path) -> Path:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        logger.info("ffmpeg is not available; keeping original video.")
+        return file_path
+
+    output_path = file_path.with_name(f"{file_path.stem}.telegram.mp4")
+    scale_filter = (
+        f"scale='min({VIDEO_TRANSCODE_MAX_WIDTH},iw)':"
+        f"'min({VIDEO_TRANSCODE_MAX_HEIGHT},ih)':"
+        "force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1"
+    )
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(file_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-vf",
+        scale_filter,
+        "-c:v",
+        "libx264",
+        "-preset",
+        VIDEO_TRANSCODE_PRESET,
+        "-crf",
+        str(VIDEO_TRANSCODE_CRF),
+        "-pix_fmt",
+        "yuv420p",
+        "-profile:v",
+        "main",
+        "-level",
+        "4.1",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+
+    logger.info("Transcoding %s to Telegram-safe H.264 MP4", file_path.name)
+    try:
+        subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=VIDEO_TRANSCODE_TIMEOUT_SECONDS,
+            check=True,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logger.warning("Video transcode timed out for %s after %ss", file_path.name, exc.timeout)
+        output_path.unlink(missing_ok=True)
+        return file_path
+    except subprocess.CalledProcessError as exc:
+        logger.warning("Video transcode failed for %s: %s", file_path.name, exc.stderr.strip())
+        output_path.unlink(missing_ok=True)
+        return file_path
+
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        output_path.unlink(missing_ok=True)
+        return file_path
+
+    _check_size(output_path)
+    return output_path
+
+
+def _normalize_download_result(result: DownloadResult) -> DownloadResult:
+    if result.kind != "video":
+        return result
+
+    metadata = _probe_media(result.file_path)
+    if not _video_needs_transcode(result.file_path, metadata):
+        return result
+
+    normalized = _transcode_video_for_telegram(result.file_path)
+    if normalized == result.file_path:
+        return result
+
+    video = _first_stream(_probe_media(normalized), "video")
+    return DownloadResult(
+        file_path=normalized,
+        caption=result.caption,
+        kind=result.kind,
+        title=result.title,
+        uploader=result.uploader,
+        duration=result.duration,
+        width=int(video["width"]) if video and video.get("width") else result.width,
+        height=int(video["height"]) if video and video.get("height") else result.height,
+        source=result.source,
+    )
+
+
 def _extension_for_url(url: str, content_type: str | None, kind: str) -> str:
     path_ext = Path(urlparse(url).path).suffix
     if path_ext and len(path_ext) <= 6:
@@ -747,7 +918,9 @@ def _download_direct_media(url: str, job_dir: Path, caption: str, kind: str) -> 
                     raise DownloadTooLargeError(f"Remote file is above the configured {MAX_UPLOAD_MB} MB limit.")
                 output.write(chunk)
 
-    return DownloadResult(file_path=file_path, caption=caption, kind=kind, title=caption, source=_hostname(url))
+    return _normalize_download_result(
+        DownloadResult(file_path=file_path, caption=caption, kind=kind, title=caption, source=_hostname(url))
+    )
 
 
 def _download_with_ydlp(
@@ -765,16 +938,18 @@ def _download_with_ydlp(
         file_path = _resolve_downloaded_file(info, ydl, job_dir)
         _check_size(file_path)
         title = info.get("title") or "Video"
-        return DownloadResult(
-            file_path=file_path,
-            caption=caption or _caption_from_info(info, file_path),
-            kind="video",
-            title=title,
-            uploader=info.get("uploader") or info.get("channel"),
-            duration=info.get("duration"),
-            width=info.get("width"),
-            height=info.get("height"),
-            source=info.get("extractor_key") or _hostname(url),
+        return _normalize_download_result(
+            DownloadResult(
+                file_path=file_path,
+                caption=caption or _caption_from_info(info, file_path),
+                kind="video",
+                title=title,
+                uploader=info.get("uploader") or info.get("channel"),
+                duration=info.get("duration"),
+                width=info.get("width"),
+                height=info.get("height"),
+                source=info.get("extractor_key") or _hostname(url),
+            )
         )
 
 
@@ -1045,8 +1220,10 @@ async def send_media_group(
         return False
 
     sent_any = False
+    total_chunks = (len(results) + MAX_MEDIA_GROUP_ITEMS - 1) // MAX_MEDIA_GROUP_ITEMS
     for chunk_start in range(0, len(results), MAX_MEDIA_GROUP_ITEMS):
         chunk = results[chunk_start : chunk_start + MAX_MEDIA_GROUP_ITEMS]
+        chunk_index = chunk_start // MAX_MEDIA_GROUP_ITEMS
         files = []
         media = []
         try:
@@ -1054,6 +1231,12 @@ async def send_media_group(
                 media_file = result.file_path.open("rb")
                 files.append(media_file)
                 caption = _result_caption(result)[:1024] if index == 0 else None
+                if caption and total_chunks > 1:
+                    part_label = (
+                        f"Album part {chunk_index + 1}/{total_chunks} "
+                        f"({chunk_start + 1}-{chunk_start + len(chunk)} of {len(results)})"
+                    )
+                    caption = _trim_caption(f"{part_label}\n\n{caption}", limit=1024)
                 if result.kind == "photo":
                     media.append(InputMediaPhoto(media=media_file, caption=caption))
                 else:
@@ -1097,7 +1280,9 @@ async def process_and_send_media_items(
                 results.append(await asyncio.to_thread(download_media_item, item, item_dir))
 
         if len(results) > 1:
-            await progress.set(f"Uploading album {len(results)} item(s)")
+            part_count = (len(results) + MAX_MEDIA_GROUP_ITEMS - 1) // MAX_MEDIA_GROUP_ITEMS
+            part_note = f" in {part_count} parts" if part_count > 1 else ""
+            await progress.set(f"Uploading album {len(results)} item(s){part_note}")
             if await send_media_group(context, chat_id, results, message_effect_id=message_effect_id):
                 return
 
@@ -1310,6 +1495,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"yt-dlp cookies: {'configured' if YTDLP_COOKIE_FILE else 'not configured'}",
         f"YouTube clients: {','.join(YOUTUBE_CLIENTS)}",
         f"YouTube PO provider: {YOUTUBE_PO_PROVIDER}",
+        f"Video normalize: {'enabled' if TELEGRAM_SAFE_VIDEO_TRANSCODE else 'disabled'}",
         f"Failure log: {FAILURE_LOG_PATH}",
         f"Message log: {MESSAGE_LOG_PATH}",
         f"Loader media: {'sticker' if LOADER_STICKER_FILE_ID else 'animation' if LOADER_ANIMATION_FILE_ID else 'not configured'}",
@@ -1438,7 +1624,11 @@ async def fileid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         file_id = target.photo[-1].file_id
 
     if not file_id:
-        await tracked_reply(update, "Reply to a sticker, GIF, photo, video, or file with /fileid.", **_message_effect_kwargs(update))
+        await tracked_reply(
+            update,
+            "Reply to a sticker, GIF, photo, video, or file with /loaderid.",
+            **_message_effect_kwargs(update),
+        )
         return
 
     await tracked_reply(update, f"{label} file_id:\n<code>{html.escape(file_id)}</code>", parse_mode="HTML")
@@ -1468,7 +1658,7 @@ def main() -> None:
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("failures", failures))
     application.add_handler(CommandHandler("clean", clean))
-    application.add_handler(CommandHandler("fileid", fileid))
+    application.add_handler(CommandHandler(["fileid", "loaderid", "id"], fileid))
     application.add_handler(CommandHandler("whoami", whoami))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     application.run_polling(drop_pending_updates=True)
