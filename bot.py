@@ -71,6 +71,8 @@ STARTED_AT = time.time()
 DOWNLOAD_ROOT = Path(os.getenv("DOWNLOAD_DIR", "downloads"))
 FAILURE_LOG_PATH = Path(os.getenv("FAILURE_LOG_PATH", "logs/failures.jsonl"))
 FAILURE_LOG_MAX_ENTRIES = int(os.getenv("FAILURE_LOG_MAX_ENTRIES", "100"))
+MESSAGE_LOG_PATH = Path(os.getenv("MESSAGE_LOG_PATH", "logs/messages.jsonl"))
+MESSAGE_LOG_MAX_ENTRIES = int(os.getenv("MESSAGE_LOG_MAX_ENTRIES", "500"))
 LOG_FULL_URLS = os.getenv("LOG_FULL_URLS", "false").lower() == "true"
 ADMIN_CHAT_IDS = {
     value.strip() for value in os.getenv("ADMIN_CHAT_IDS", "").split(",") if value.strip()
@@ -102,6 +104,8 @@ APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 APIFY_INSTAGRAM_ACTOR = os.getenv("APIFY_INSTAGRAM_ACTOR", "apify/instagram-scraper")
 APIFY_MAX_CHARGE_USD = os.getenv("APIFY_MAX_CHARGE_USD")
 TELEGRAM_MESSAGE_EFFECT_ID = os.getenv("TELEGRAM_MESSAGE_EFFECT_ID", "").strip()
+LOADER_STICKER_FILE_ID = os.getenv("LOADER_STICKER_FILE_ID", "").strip()
+LOADER_ANIMATION_FILE_ID = os.getenv("LOADER_ANIMATION_FILE_ID", "").strip()
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 USERNAME_RE = re.compile(r"^@(?P<username>[A-Za-z0-9_.]+)(?:\s+(?P<count>\d+))?$")
@@ -163,7 +167,7 @@ class DownloadResult:
 
 
 class ProgressMessage:
-    def __init__(self, message, initial_step: str) -> None:
+    def __init__(self, message, initial_step: str, cleanup_messages: list | None = None) -> None:
         self.message = message
         self.step = initial_step
         self.history = [initial_step]
@@ -171,6 +175,7 @@ class ProgressMessage:
         self.done = asyncio.Event()
         self.task: asyncio.Task | None = None
         self.last_text: tuple[str | None, str] | None = None
+        self.cleanup_messages = cleanup_messages or []
 
     async def start(self) -> None:
         await self._edit(self._render(), parse_mode="HTML")
@@ -192,6 +197,7 @@ class ProgressMessage:
             except asyncio.CancelledError:
                 pass
         if final_text:
+            await self._delete_cleanup_messages()
             await self._edit(final_text)
 
     async def delete(self) -> None:
@@ -202,10 +208,19 @@ class ProgressMessage:
                 await self.task
             except asyncio.CancelledError:
                 pass
+        await self._delete_cleanup_messages()
         try:
             await self.message.delete()
         except TelegramError as exc:
             logger.debug("Progress delete failed: %s", exc)
+
+    async def _delete_cleanup_messages(self) -> None:
+        for message in self.cleanup_messages:
+            try:
+                await message.delete()
+            except TelegramError as exc:
+                logger.debug("Cleanup message delete failed: %s", exc)
+        self.cleanup_messages = []
 
     async def _run(self) -> None:
         while not self.done.is_set():
@@ -228,36 +243,23 @@ class ProgressMessage:
     def _render(self) -> str:
         elapsed = max(1, int(time.time() - self.started_at))
         frame = PROGRESS_FRAMES[elapsed % len(PROGRESS_FRAMES)] if PROGRESS_FRAMES else "*"
-        width = 26
-        cursor = (elapsed * 2) % (width * 2)
-        if cursor >= width:
-            cursor = (width * 2) - cursor - 1
-        bar = ["."] * width
-        for offset in range(6):
-            pos = cursor - offset
-            if 0 <= pos < width:
-                bar[pos] = ">" if offset == 0 else "="
+        width = 12
+        cursor = elapsed % width
+        bar = ["▱"] * width
+        for offset in range(4):
+            bar[(cursor - offset) % width] = "▰"
         minutes, seconds = divmod(elapsed, 60)
-        trace = [
-            f"{index:02d} {self._clip(step, 27)}"
-            for index, step in enumerate(self.history[-4:], start=1)
-        ]
+        stage_line = "  ".join(self._stage_tokens())
+        trace = " → ".join(self._clip(step, 18) for step in self.history[-3:])
         lines = [
-            "+================================+",
-            "| TG-X // MEDIA PIPELINE         |",
-            "+================================+",
-            f"| NOW {frame} {self._clip(self.step, 24):<24} |",
-            f"| T+ {minutes:02d}:{seconds:02d} [{''.join(bar)}] |",
-            "+--------------------------------+",
-            *self._stage_lines(),
-            "+--------------------------------+",
-            "| TRACE                          |",
-            *[f"| {line:<30} |" for line in trace[-3:]],
-            "+================================+",
+            f"<b>{html.escape(self._clip(self.step, 42))}</b>",
+            f"<code>{''.join(bar)}</code>  {minutes:02d}:{seconds:02d}  {html.escape(frame)}",
+            html.escape(stage_line),
+            f"<i>{html.escape(trace)}</i>",
         ]
-        return f"<pre>{html.escape(chr(10).join(lines))}</pre>"
+        return "\n".join(lines)
 
-    def _stage_lines(self) -> list[str]:
+    def _stage_tokens(self) -> list[str]:
         stages = [
             ("READ", ("reading request", "booting")),
             ("FETCH", ("reading instagram", "fetching", "analyzing", "found")),
@@ -267,16 +269,16 @@ class ProgressMessage:
         ]
         current = self.step.lower()
         history = " ".join(self.history).lower()
-        rows = []
+        tokens = []
         for label, needles in stages:
             if any(needle in current for needle in needles):
-                state = "RUN"
+                state = "●"
             elif any(needle in history for needle in needles):
-                state = " OK"
+                state = "✓"
             else:
-                state = " .."
-            rows.append(f"| {label:<6} [{state}]                  |")
-        return rows
+                state = "·"
+            tokens.append(f"{label} {state}")
+        return tokens
 
     @staticmethod
     def _clip(value: str, limit: int) -> str:
@@ -296,6 +298,38 @@ def _message_effect_kwargs_for_chat(chat_type: str | None) -> dict:
     if TELEGRAM_MESSAGE_EFFECT_ID and chat_type == "private":
         return {"message_effect_id": TELEGRAM_MESSAGE_EFFECT_ID}
     return {}
+
+
+async def tracked_reply(update: Update, text: str, **kwargs):
+    if not update.message:
+        return None
+    message = await update.message.reply_text(text, **kwargs)
+    record_bot_messages(update.message.chat_id, message)
+    return message
+
+
+async def send_loader(context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_type: str | None):
+    effect_kwargs = _message_effect_kwargs_for_chat(chat_type)
+    try:
+        if LOADER_STICKER_FILE_ID:
+            message = await context.bot.send_sticker(
+                chat_id=chat_id,
+                sticker=LOADER_STICKER_FILE_ID,
+                **effect_kwargs,
+            )
+            record_bot_messages(chat_id, message)
+            return message
+        if LOADER_ANIMATION_FILE_ID:
+            message = await context.bot.send_animation(
+                chat_id=chat_id,
+                animation=LOADER_ANIMATION_FILE_ID,
+                **effect_kwargs,
+            )
+            record_bot_messages(chat_id, message)
+            return message
+    except TelegramError as exc:
+        logger.info("Loader animation failed: %s", exc)
+    return None
 
 
 def _hostname(url: str) -> str:
@@ -428,6 +462,62 @@ def clear_failures() -> int:
     count = len(FAILURE_LOG_PATH.read_text(encoding="utf-8").splitlines())
     FAILURE_LOG_PATH.write_text("", encoding="utf-8")
     return count
+
+
+def trim_message_log() -> None:
+    if MESSAGE_LOG_MAX_ENTRIES <= 0 or not MESSAGE_LOG_PATH.exists():
+        return
+    lines = MESSAGE_LOG_PATH.read_text(encoding="utf-8").splitlines()
+    if len(lines) <= MESSAGE_LOG_MAX_ENTRIES:
+        return
+    MESSAGE_LOG_PATH.write_text("\n".join(lines[-MESSAGE_LOG_MAX_ENTRIES:]) + "\n", encoding="utf-8")
+
+
+def record_bot_messages(chat_id: int | str, messages) -> None:
+    if messages is None:
+        return
+    if not isinstance(messages, (list, tuple)):
+        messages = [messages]
+
+    records = []
+    for message in messages:
+        message_id = getattr(message, "message_id", None)
+        if message_id is None:
+            continue
+        records.append({"ts": _now_iso(), "chat_id": str(chat_id), "message_id": int(message_id)})
+    if not records:
+        return
+
+    try:
+        MESSAGE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with MESSAGE_LOG_PATH.open("a", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
+        trim_message_log()
+    except OSError as exc:
+        logger.debug("Could not write message log: %s", exc)
+
+
+def read_tracked_message_ids(chat_id: int | str, limit: int) -> list[int]:
+    if not MESSAGE_LOG_PATH.exists():
+        return []
+    seen = set()
+    message_ids = []
+    for line in reversed(MESSAGE_LOG_PATH.read_text(encoding="utf-8").splitlines()):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if str(record.get("chat_id")) != str(chat_id):
+            continue
+        message_id = record.get("message_id")
+        if not isinstance(message_id, int) or message_id in seen:
+            continue
+        seen.add(message_id)
+        message_ids.append(message_id)
+        if len(message_ids) >= limit:
+            break
+    return message_ids
 
 
 def _format_bytes(size: int) -> str:
@@ -910,32 +1000,35 @@ async def send_download(
     with result.file_path.open("rb") as media_file:
         try:
             if result.kind == "photo" and file_size <= SEND_AS_DOCUMENT_BYTES:
-                await context.bot.send_photo(
+                sent_message = await context.bot.send_photo(
                     chat_id=chat_id,
                     photo=media_file,
                     caption=caption[:1024],
                     **effect_kwargs,
                 )
+                record_bot_messages(chat_id, sent_message)
                 return
             if result.kind == "video" and file_size <= SEND_AS_DOCUMENT_BYTES:
-                await context.bot.send_video(
+                sent_message = await context.bot.send_video(
                     chat_id=chat_id,
                     video=media_file,
                     caption=caption[:1024],
                     supports_streaming=True,
                     **effect_kwargs,
                 )
+                record_bot_messages(chat_id, sent_message)
                 return
         except TelegramError as exc:
             logger.info("Inline media upload failed, retrying as document: %s", exc)
 
         media_file.seek(0)
-        await context.bot.send_document(
+        sent_message = await context.bot.send_document(
             chat_id=chat_id,
             document=media_file,
             caption=caption[:1024],
             **effect_kwargs,
         )
+        record_bot_messages(chat_id, sent_message)
 
 
 def _can_send_in_media_group(result: DownloadResult) -> bool:
@@ -966,7 +1059,8 @@ async def send_media_group(
                 else:
                     media.append(InputMediaVideo(media=media_file, caption=caption, supports_streaming=True))
             effect_kwargs = {"message_effect_id": message_effect_id} if message_effect_id else {}
-            await context.bot.send_media_group(chat_id=chat_id, media=media, **effect_kwargs)
+            sent_messages = await context.bot.send_media_group(chat_id=chat_id, media=media, **effect_kwargs)
+            record_bot_messages(chat_id, sent_messages)
             sent_any = True
         except TelegramError as exc:
             logger.info("Media group upload failed: %s", exc)
@@ -1099,11 +1193,17 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         logger.info("Cleaned %s stale download files", cleanup["removed_count"])
 
     text = update.message.text.strip()
-    status_message = await update.message.reply_text(
+    loader_message = await send_loader(
+        context,
+        update.message.chat_id,
+        update.effective_chat.type if update.effective_chat else None,
+    )
+    status_message = await tracked_reply(
+        update,
         "Booting media pipeline...",
         **_message_effect_kwargs(update),
     )
-    progress = ProgressMessage(status_message, "Reading request")
+    progress = ProgressMessage(status_message, "Reading request", cleanup_messages=[loader_message] if loader_message else [])
     await progress.start()
 
     try:
@@ -1149,10 +1249,11 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    await update.message.reply_text(
+    await tracked_reply(
+        update,
         "Send a YouTube, X/Twitter, TikTok, or Instagram link. "
         "For Instagram reels, send @username 3 or !reels username 3. "
-        "Use /demo to preview the progress HUD.",
+        "Use /demo to preview the progress HUD or /clean 30 to remove recent bot clutter.",
         **_message_effect_kwargs(update),
     )
 
@@ -1160,11 +1261,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def demo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    status_message = await update.message.reply_text(
+    loader_message = await send_loader(
+        context,
+        update.message.chat_id,
+        update.effective_chat.type if update.effective_chat else None,
+    )
+    status_message = await tracked_reply(
+        update,
         "Booting media pipeline...",
         **_message_effect_kwargs(update),
     )
-    progress = ProgressMessage(status_message, "Reading request")
+    progress = ProgressMessage(status_message, "Reading request", cleanup_messages=[loader_message] if loader_message else [])
     await progress.start()
     for step in (
         "Reading Instagram post",
@@ -1204,17 +1311,20 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"YouTube clients: {','.join(YOUTUBE_CLIENTS)}",
         f"YouTube PO provider: {YOUTUBE_PO_PROVIDER}",
         f"Failure log: {FAILURE_LOG_PATH}",
+        f"Message log: {MESSAGE_LOG_PATH}",
+        f"Loader media: {'sticker' if LOADER_STICKER_FILE_ID else 'animation' if LOADER_ANIMATION_FILE_ID else 'not configured'}",
         f"Admin commands: {'configured' if ADMIN_CHAT_IDS else 'not configured'}",
         f"Your chat id: {_chat_id(update)}",
     ]
-    await update.message.reply_text("\n".join(lines), **_message_effect_kwargs(update))
+    await tracked_reply(update, "\n".join(lines), **_message_effect_kwargs(update))
 
 
 async def failures(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
     if not _is_admin(update):
-        await update.message.reply_text(
+        await tracked_reply(
+            update,
             f"Set ADMIN_CHAT_IDS={_chat_id(update)} in the host env to enable failure-log access.",
             **_message_effect_kwargs(update),
         )
@@ -1222,7 +1332,8 @@ async def failures(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if context.args and context.args[0].lower() in {"clear", "reset"}:
         removed = clear_failures()
-        await update.message.reply_text(
+        await tracked_reply(
+            update,
             f"Cleared {removed} failure log entr{'y' if removed == 1 else 'ies'}.",
             **_message_effect_kwargs(update),
         )
@@ -1237,7 +1348,7 @@ async def failures(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     entries = read_failures(limit)
     if not entries:
-        await update.message.reply_text("No failures logged yet.", **_message_effect_kwargs(update))
+        await tracked_reply(update, "No failures logged yet.", **_message_effect_kwargs(update))
         return
 
     lines = [f"Last {len(entries)} failure(s)"]
@@ -1251,13 +1362,93 @@ async def failures(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 ]
             )
         )
-    await update.message.reply_text(_trim_caption("\n\n".join(lines), limit=3900), **_message_effect_kwargs(update))
+    await tracked_reply(update, _trim_caption("\n\n".join(lines), limit=3900), **_message_effect_kwargs(update))
+
+
+async def clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not _is_admin(update):
+        await tracked_reply(
+            update,
+            f"Set ADMIN_CHAT_IDS={_chat_id(update)} in the host env to enable cleanup access.",
+            **_message_effect_kwargs(update),
+        )
+        return
+
+    limit = 30
+    if context.args:
+        try:
+            limit = max(1, min(100, int(context.args[0])))
+        except ValueError:
+            limit = 30
+
+    chat_id = update.message.chat_id
+    message_ids = read_tracked_message_ids(chat_id, limit)
+    deleted = 0
+    failed = 0
+    for message_id in message_ids:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            deleted += 1
+        except TelegramError:
+            failed += 1
+
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+
+    sent_message = await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"Cleaned {deleted} bot message(s). {failed} could not be removed.",
+        **_message_effect_kwargs(update),
+    )
+    record_bot_messages(chat_id, sent_message)
+
+
+async def fileid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not _is_admin(update):
+        await tracked_reply(
+            update,
+            f"Set ADMIN_CHAT_IDS={_chat_id(update)} in the host env to enable file-id access.",
+            **_message_effect_kwargs(update),
+        )
+        return
+
+    target = update.message.reply_to_message or update.message
+    label = None
+    file_id = None
+    if target.sticker:
+        label = "sticker"
+        file_id = target.sticker.file_id
+    elif target.animation:
+        label = "animation"
+        file_id = target.animation.file_id
+    elif target.document:
+        label = "document"
+        file_id = target.document.file_id
+    elif target.video:
+        label = "video"
+        file_id = target.video.file_id
+    elif target.photo:
+        label = "photo"
+        file_id = target.photo[-1].file_id
+
+    if not file_id:
+        await tracked_reply(update, "Reply to a sticker, GIF, photo, video, or file with /fileid.", **_message_effect_kwargs(update))
+        return
+
+    await tracked_reply(update, f"{label} file_id:\n<code>{html.escape(file_id)}</code>", parse_mode="HTML")
 
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    await update.message.reply_text(
+    await tracked_reply(
+        update,
         f"Chat ID: {_chat_id(update)}\nUser ID: {_user_id(update)}",
         **_message_effect_kwargs(update),
     )
@@ -1276,6 +1467,8 @@ def main() -> None:
     application.add_handler(CommandHandler("demo", demo))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("failures", failures))
+    application.add_handler(CommandHandler("clean", clean))
+    application.add_handler(CommandHandler("fileid", fileid))
     application.add_handler(CommandHandler("whoami", whoami))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     application.run_polling(drop_pending_updates=True)
