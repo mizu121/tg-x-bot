@@ -3,7 +3,6 @@ services:
     name: tg-x-bot
     runtime: docker
     plan: starter
-    maxShutdownDelaySeconds: 120
     disk:
       name: bot-data
       mountPath: /var/data
