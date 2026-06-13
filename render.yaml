@@ -18,6 +18,10 @@ services:
         sync: false
       - key: LOADER_ANIMATION_FILE_ID
         sync: false
+      - key: YTDLP_COOKIES_B64
+        sync: false
+      - key: YTDLP_COOKIE_FILE
+        sync: false
       - key: APIFY_MAX_CHARGE_USD
         value: "0.05"
       - key: MAX_CONCURRENT_DOWNLOADS

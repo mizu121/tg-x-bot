@@ -140,7 +140,8 @@ CHILD_POST_KEYS = (
     "sidecar_to_children",
     "media",
 )
-SAFE_QUERY_KEYS = {"v", "list", "t", "start", "end"}
+SAFE_QUERY_KEYS = {"v", "t", "start", "end"}
+YOUTUBE_SINGLE_VIDEO_QUERY_KEYS = {"v", "t", "start", "end"}
 MAX_MEDIA_GROUP_ITEMS = 10
 
 download_slots = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
@@ -419,6 +420,18 @@ def _sanitize_url(url: str) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", urlencode(safe_query), ""))
 
 
+def _normalize_download_url(url: str) -> str:
+    if not _is_youtube_url(url):
+        return url
+    parsed = urlparse(url)
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query)
+        if key in YOUTUBE_SINGLE_VIDEO_QUERY_KEYS
+    ]
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", urlencode(query), ""))
+
+
 def _request_url(text: str) -> str | None:
     match = URL_RE.search(text or "")
     if not match:
@@ -668,6 +681,24 @@ def _youtube_error_allows_fallback(exc: BaseException) -> bool:
             "requested format is not available",
         )
     )
+
+
+def _youtube_error_needs_cookies(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return _is_youtube_signin_error(exc) or any(
+        needle in message
+        for needle in (
+            "use --cookies-from-browser",
+            "use --cookies",
+            "cookies for the authentication",
+            "login required",
+        )
+    )
+
+
+def _is_youtube_signin_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "sign in to confirm" in message and "not a bot" in message
 
 
 def _youtube_client_attempts() -> list[list[str]]:
@@ -1473,7 +1504,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 await progress.finish("Send me a video, Instagram post, or @username 3 for reels.")
                 return
 
-            url = match.group(0).rstrip(".,)")
+            url = _normalize_download_url(match.group(0).rstrip(".,)"))
             if "instagram.com" in url:
                 await handle_instagram_url(update, context, url, progress)
             else:
@@ -1496,8 +1527,16 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 "Try again once; if it repeats, this clip needs a stronger worker."
             )
         except yt_dlp.utils.DownloadError as exc:
-            record_failure(update, text, exc, "yt_dlp")
-            await progress.finish("Could not download that link. It may be private, blocked, age-gated, or need cookies.")
+            stage = "yt_cookies" if _youtube_error_needs_cookies(exc) else "yt_dlp"
+            record_failure(update, text, exc, stage)
+            if stage == "yt_cookies":
+                await progress.finish(
+                    "YouTube is asking for a real browser/login session. "
+                    "PO token is enabled, but this link still needs yt-dlp cookies. "
+                    "Set YTDLP_COOKIES_B64 from a Netscape YouTube cookie export and retry."
+                )
+            else:
+                await progress.finish("Could not download that link. It may be private, blocked, age-gated, or need cookies.")
         except Exception as exc:
             record_failure(update, text, exc, "unexpected")
             logger.exception("Unexpected error while handling request")
