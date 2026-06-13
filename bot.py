@@ -108,10 +108,11 @@ TELEGRAM_MESSAGE_EFFECT_ID = os.getenv("TELEGRAM_MESSAGE_EFFECT_ID", "").strip()
 LOADER_STICKER_FILE_ID = os.getenv("LOADER_STICKER_FILE_ID", "").strip()
 LOADER_ANIMATION_FILE_ID = os.getenv("LOADER_ANIMATION_FILE_ID", "").strip()
 TELEGRAM_SAFE_VIDEO_TRANSCODE = os.getenv("TELEGRAM_SAFE_VIDEO_TRANSCODE", "true").lower() != "false"
-VIDEO_TRANSCODE_CRF = int(os.getenv("VIDEO_TRANSCODE_CRF", "24"))
-VIDEO_TRANSCODE_PRESET = os.getenv("VIDEO_TRANSCODE_PRESET", "veryfast")
-VIDEO_TRANSCODE_MAX_WIDTH = int(os.getenv("VIDEO_TRANSCODE_MAX_WIDTH", "1080"))
-VIDEO_TRANSCODE_MAX_HEIGHT = int(os.getenv("VIDEO_TRANSCODE_MAX_HEIGHT", "1920"))
+VIDEO_TRANSCODE_CRF = int(os.getenv("VIDEO_TRANSCODE_CRF", "28"))
+VIDEO_TRANSCODE_PRESET = os.getenv("VIDEO_TRANSCODE_PRESET", "ultrafast")
+VIDEO_TRANSCODE_MAX_WIDTH = int(os.getenv("VIDEO_TRANSCODE_MAX_WIDTH", "720"))
+VIDEO_TRANSCODE_MAX_HEIGHT = int(os.getenv("VIDEO_TRANSCODE_MAX_HEIGHT", "1280"))
+VIDEO_TRANSCODE_THREADS = int(os.getenv("VIDEO_TRANSCODE_THREADS", "1"))
 VIDEO_TRANSCODE_TIMEOUT_SECONDS = int(os.getenv("VIDEO_TRANSCODE_TIMEOUT_SECONDS", "240"))
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
@@ -142,6 +143,8 @@ SAFE_QUERY_KEYS = {"v", "list", "t", "start", "end"}
 MAX_MEDIA_GROUP_ITEMS = 10
 
 download_slots = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+active_chat_ids: set[int] = set()
+active_chat_lock = asyncio.Lock()
 
 
 class DownloadTooLargeError(Exception):
@@ -149,6 +152,10 @@ class DownloadTooLargeError(Exception):
 
 
 class MissingConfigError(Exception):
+    pass
+
+
+class VideoTranscodeError(Exception):
     pass
 
 
@@ -271,6 +278,7 @@ class ProgressMessage:
             ("READ", ("reading request", "booting")),
             ("FETCH", ("reading instagram", "fetching", "analyzing", "found")),
             ("DL", ("downloading",)),
+            ("CONV", ("converting", "normalizing")),
             ("UPLOAD", ("uploading",)),
             ("DONE", ("done", "sent")),
         ]
@@ -801,10 +809,17 @@ def _transcode_video_for_telegram(file_path: Path) -> Path:
     )
     command = [
         ffmpeg,
+        "-nostdin",
         "-hide_banner",
         "-loglevel",
         "error",
         "-y",
+        "-threads",
+        str(VIDEO_TRANSCODE_THREADS),
+        "-filter_threads",
+        str(VIDEO_TRANSCODE_THREADS),
+        "-filter_complex_threads",
+        str(VIDEO_TRANSCODE_THREADS),
         "-i",
         str(file_path),
         "-map",
@@ -815,6 +830,8 @@ def _transcode_video_for_telegram(file_path: Path) -> Path:
         scale_filter,
         "-c:v",
         "libx264",
+        "-threads",
+        str(VIDEO_TRANSCODE_THREADS),
         "-preset",
         VIDEO_TRANSCODE_PRESET,
         "-crf",
@@ -846,15 +863,15 @@ def _transcode_video_for_telegram(file_path: Path) -> Path:
     except subprocess.TimeoutExpired as exc:
         logger.warning("Video transcode timed out for %s after %ss", file_path.name, exc.timeout)
         output_path.unlink(missing_ok=True)
-        return file_path
+        raise VideoTranscodeError("Video conversion timed out before Telegram-safe output was created.") from exc
     except subprocess.CalledProcessError as exc:
         logger.warning("Video transcode failed for %s: %s", file_path.name, exc.stderr.strip())
         output_path.unlink(missing_ok=True)
-        return file_path
+        raise VideoTranscodeError("Video conversion failed before Telegram-safe output was created.") from exc
 
     if not output_path.exists() or output_path.stat().st_size == 0:
         output_path.unlink(missing_ok=True)
-        return file_path
+        raise VideoTranscodeError("Video conversion produced an empty output file.")
 
     _check_size(output_path)
     return output_path
@@ -918,9 +935,7 @@ def _download_direct_media(url: str, job_dir: Path, caption: str, kind: str) -> 
                     raise DownloadTooLargeError(f"Remote file is above the configured {MAX_UPLOAD_MB} MB limit.")
                 output.write(chunk)
 
-    return _normalize_download_result(
-        DownloadResult(file_path=file_path, caption=caption, kind=kind, title=caption, source=_hostname(url))
-    )
+    return DownloadResult(file_path=file_path, caption=caption, kind=kind, title=caption, source=_hostname(url))
 
 
 def _download_with_ydlp(
@@ -938,18 +953,16 @@ def _download_with_ydlp(
         file_path = _resolve_downloaded_file(info, ydl, job_dir)
         _check_size(file_path)
         title = info.get("title") or "Video"
-        return _normalize_download_result(
-            DownloadResult(
-                file_path=file_path,
-                caption=caption or _caption_from_info(info, file_path),
-                kind="video",
-                title=title,
-                uploader=info.get("uploader") or info.get("channel"),
-                duration=info.get("duration"),
-                width=info.get("width"),
-                height=info.get("height"),
-                source=info.get("extractor_key") or _hostname(url),
-            )
+        return DownloadResult(
+            file_path=file_path,
+            caption=caption or _caption_from_info(info, file_path),
+            kind="video",
+            title=title,
+            uploader=info.get("uploader") or info.get("channel"),
+            duration=info.get("duration"),
+            width=info.get("width"),
+            height=info.get("height"),
+            source=info.get("extractor_key") or _hostname(url),
         )
 
 
@@ -1277,7 +1290,11 @@ async def process_and_send_media_items(
             for index, item in enumerate(items, start=1):
                 item_dir = job_dir / f"item-{index}"
                 await progress.set(f"Downloading {item.label}")
-                results.append(await asyncio.to_thread(download_media_item, item, item_dir))
+                result = await asyncio.to_thread(download_media_item, item, item_dir)
+                if result.kind == "video" and await asyncio.to_thread(_video_needs_transcode, result.file_path):
+                    await progress.set(f"Converting {item.label} for Telegram")
+                    result = await asyncio.to_thread(_normalize_download_result, result)
+                results.append(result)
 
         if len(results) > 1:
             part_count = (len(results) + MAX_MEDIA_GROUP_ITEMS - 1) // MAX_MEDIA_GROUP_ITEMS
@@ -1373,62 +1390,84 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not update.message or not update.message.text:
         return
 
-    cleanup = await asyncio.to_thread(cleanup_downloads)
-    if cleanup["removed_count"]:
-        logger.info("Cleaned %s stale download files", cleanup["removed_count"])
-
+    chat_id = update.message.chat_id
     text = update.message.text.strip()
-    loader_message = await send_loader(
-        context,
-        update.message.chat_id,
-        update.effective_chat.type if update.effective_chat else None,
-    )
-    status_message = await tracked_reply(
-        update,
-        "Booting media pipeline...",
-        **_message_effect_kwargs(update),
-    )
-    progress = ProgressMessage(status_message, "Reading request", cleanup_messages=[loader_message] if loader_message else [])
-    await progress.start()
+
+    async with active_chat_lock:
+        if chat_id in active_chat_ids:
+            await tracked_reply(
+                update,
+                "Still processing the previous request. Wait for upload or failure before sending another link.",
+                **_message_effect_kwargs(update),
+            )
+            return
+        active_chat_ids.add(chat_id)
 
     try:
-        reels_match = REELS_RE.match(text)
-        username_match = USERNAME_RE.match(text)
-        if reels_match or username_match:
-            match = reels_match or username_match
-            username = match.group("username")
-            count = int(match.group("count") or MAX_REELS_PER_REQUEST)
-            await handle_reels(update, context, username, count, progress)
-            return
+        cleanup = await asyncio.to_thread(cleanup_downloads)
+        if cleanup["removed_count"]:
+            logger.info("Cleaned %s stale download files", cleanup["removed_count"])
 
-        match = URL_RE.search(text)
-        if not match:
-            await progress.finish("Send me a video, Instagram post, or @username 3 for reels.")
-            return
-
-        url = match.group(0).rstrip(".,)")
-        if "instagram.com" in url:
-            await handle_instagram_url(update, context, url, progress)
-        else:
-            await progress.set("Analyzing link with yt-dlp")
-            await process_and_send_url(update, context, url, progress)
-            await progress.delete()
-    except DownloadTooLargeError as exc:
-        record_failure(update, text, exc, "download_size")
-        await progress.finish(
-            f"File is too large for Telegram Bot API upload. {exc}\n\n"
-            "I keep the limit just under 50 MB because Telegram cloud bots reject larger uploads."
+        loader_message = await send_loader(
+            context,
+            chat_id,
+            update.effective_chat.type if update.effective_chat else None,
         )
-    except MissingConfigError as exc:
-        record_failure(update, text, exc, "config")
-        await progress.finish(str(exc))
-    except yt_dlp.utils.DownloadError as exc:
-        record_failure(update, text, exc, "yt_dlp")
-        await progress.finish("Could not download that link. It may be private, blocked, age-gated, or need cookies.")
-    except Exception as exc:
-        record_failure(update, text, exc, "unexpected")
-        logger.exception("Unexpected error while handling request")
-        await progress.finish("Something went wrong while downloading that media.")
+        status_message = await tracked_reply(
+            update,
+            "Booting media pipeline...",
+            **_message_effect_kwargs(update),
+        )
+        progress = ProgressMessage(status_message, "Reading request", cleanup_messages=[loader_message] if loader_message else [])
+        await progress.start()
+
+        try:
+            reels_match = REELS_RE.match(text)
+            username_match = USERNAME_RE.match(text)
+            if reels_match or username_match:
+                match = reels_match or username_match
+                username = match.group("username")
+                count = int(match.group("count") or MAX_REELS_PER_REQUEST)
+                await handle_reels(update, context, username, count, progress)
+                return
+
+            match = URL_RE.search(text)
+            if not match:
+                await progress.finish("Send me a video, Instagram post, or @username 3 for reels.")
+                return
+
+            url = match.group(0).rstrip(".,)")
+            if "instagram.com" in url:
+                await handle_instagram_url(update, context, url, progress)
+            else:
+                await progress.set("Analyzing link with yt-dlp")
+                await process_and_send_url(update, context, url, progress)
+                await progress.delete()
+        except DownloadTooLargeError as exc:
+            record_failure(update, text, exc, "download_size")
+            await progress.finish(
+                f"File is too large for Telegram Bot API upload. {exc}\n\n"
+                "I keep the limit just under 50 MB because Telegram cloud bots reject larger uploads."
+            )
+        except MissingConfigError as exc:
+            record_failure(update, text, exc, "config")
+            await progress.finish(str(exc))
+        except VideoTranscodeError as exc:
+            record_failure(update, text, exc, "transcode")
+            await progress.finish(
+                "I downloaded the video, but Telegram-safe conversion failed on this host. "
+                "Try again once; if it repeats, this clip needs a stronger worker."
+            )
+        except yt_dlp.utils.DownloadError as exc:
+            record_failure(update, text, exc, "yt_dlp")
+            await progress.finish("Could not download that link. It may be private, blocked, age-gated, or need cookies.")
+        except Exception as exc:
+            record_failure(update, text, exc, "unexpected")
+            logger.exception("Unexpected error while handling request")
+            await progress.finish("Something went wrong while downloading that media.")
+    finally:
+        async with active_chat_lock:
+            active_chat_ids.discard(chat_id)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1462,6 +1501,7 @@ async def demo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Reading Instagram post",
         "Found Instagram album: 4 item(s)",
         "Downloading slide 1/4",
+        "Converting slide 1/4 for Telegram",
         "Downloading slide 2/4",
         "Uploading album 4 item(s)",
     ):
@@ -1495,7 +1535,11 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"yt-dlp cookies: {'configured' if YTDLP_COOKIE_FILE else 'not configured'}",
         f"YouTube clients: {','.join(YOUTUBE_CLIENTS)}",
         f"YouTube PO provider: {YOUTUBE_PO_PROVIDER}",
-        f"Video normalize: {'enabled' if TELEGRAM_SAFE_VIDEO_TRANSCODE else 'disabled'}",
+        (
+            f"Video normalize: {'enabled' if TELEGRAM_SAFE_VIDEO_TRANSCODE else 'disabled'} "
+            f"({VIDEO_TRANSCODE_MAX_WIDTH}x{VIDEO_TRANSCODE_MAX_HEIGHT}, {VIDEO_TRANSCODE_PRESET}, "
+            f"threads={VIDEO_TRANSCODE_THREADS})"
+        ),
         f"Failure log: {FAILURE_LOG_PATH}",
         f"Message log: {MESSAGE_LOG_PATH}",
         f"Loader media: {'sticker' if LOADER_STICKER_FILE_ID else 'animation' if LOADER_ANIMATION_FILE_ID else 'not configured'}",

@@ -47,13 +47,15 @@ services:
       - key: TELEGRAM_SAFE_VIDEO_TRANSCODE
         value: "true"
       - key: VIDEO_TRANSCODE_CRF
-        value: "24"
+        value: "28"
       - key: VIDEO_TRANSCODE_PRESET
-        value: "veryfast"
+        value: "ultrafast"
       - key: VIDEO_TRANSCODE_MAX_WIDTH
-        value: "1080"
+        value: "720"
       - key: VIDEO_TRANSCODE_MAX_HEIGHT
-        value: "1920"
+        value: "1280"
+      - key: VIDEO_TRANSCODE_THREADS
+        value: "1"
       - key: VIDEO_TRANSCODE_TIMEOUT_SECONDS
         value: "240"
       - key: YOUTUBE_CLIENTS

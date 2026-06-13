@@ -27,8 +27,9 @@ The bot defaults are intentionally conservative:
 - `YTDLP_FORMAT` caps default downloads at 720p to reduce bandwidth, disk, and CPU while still allowing fallbacks.
 - `YOUTUBE_CLIENTS` and `YOUTUBE_FALLBACK_CLIENTS` try multiple yt-dlp YouTube clients before giving up.
 - Instagram carousel posts are downloaded as one batch and sent as Telegram albums when the media fits Telegram's album/upload rules.
-- `TELEGRAM_SAFE_VIDEO_TRANSCODE=true` converts VP9/HEVC/odd Instagram MP4s to Telegram-safe H.264/AAC MP4 before upload.
+- `TELEGRAM_SAFE_VIDEO_TRANSCODE=true` converts VP9/HEVC/odd Instagram MP4s to Telegram-safe H.264/AAC MP4 before upload. Render defaults cap conversion at 720x1280 with one ffmpeg thread to avoid worker restarts.
 - Progress messages use a compact live status card and are edited in place.
+- Chats are kept to one active job at a time so repeated links do not pile up while conversion/upload is still running.
 - `TELEGRAM_MESSAGE_EFFECT_ID` can attach a Telegram message effect in private chats when you provide a valid effect ID.
 - `LOADER_STICKER_FILE_ID` or `LOADER_ANIMATION_FILE_ID` can show a Telegram-native animated loader during jobs.
 - Bot-sent messages are tracked in `MESSAGE_LOG_PATH` so `/clean` can remove recent clutter.
