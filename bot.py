@@ -616,6 +616,7 @@ def _extension_for_url(url: str, content_type: str | None, kind: str) -> str:
 
 
 def _download_direct_media(url: str, job_dir: Path, caption: str, kind: str) -> DownloadResult:
+    job_dir.mkdir(parents=True, exist_ok=True)
     with requests.get(url, stream=True, timeout=(10, REQUEST_TIMEOUT_SECONDS)) as response:
         response.raise_for_status()
         content_type = response.headers.get("content-type")
