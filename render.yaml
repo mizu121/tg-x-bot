@@ -14,6 +14,10 @@ services:
         sync: false
       - key: ADMIN_CHAT_IDS
         sync: false
+      - key: LOADER_STICKER_FILE_ID
+        sync: false
+      - key: LOADER_ANIMATION_FILE_ID
+        sync: false
       - key: APIFY_MAX_CHARGE_USD
         value: "0.05"
       - key: MAX_CONCURRENT_DOWNLOADS
