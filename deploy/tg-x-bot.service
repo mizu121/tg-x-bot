@@ -1,0 +1,18 @@
+[Unit]
+Description=Telegram X video downloader bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/tg-x-bot
+EnvironmentFile=/home/ubuntu/tg-x-bot/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/ubuntu/tg-x-bot/.venv/bin/python /home/ubuntu/tg-x-bot/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

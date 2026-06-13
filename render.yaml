@@ -1,0 +1,18 @@
+services:
+  - type: worker
+    name: tg-x-bot
+    runtime: docker
+    plan: starter
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: APIFY_TOKEN
+        sync: false
+      - key: MAX_CONCURRENT_DOWNLOADS
+        value: "1"
+      - key: MAX_UPLOAD_MB
+        value: "49"
+      - key: SEND_AS_DOCUMENT_MB
+        value: "45"
+      - key: MAX_REELS_PER_REQUEST
+        value: "5"

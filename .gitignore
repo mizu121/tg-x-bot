@@ -1,5 +1,11 @@
 downloads/
 __pycache__/
 .env
+.venv/
+venv/
 *.pyc
 .DS_Store
+cookies.txt
+*.cookies
+*.cookie
+logs/
