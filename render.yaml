@@ -65,4 +65,15 @@ services:
       - key: YOUTUBE_FALLBACK_CLIENTS
         value: "android,web;web_safari;tv;ios"
       - key: YOUTUBE_PO_PROVIDER
-        value: "none"
+        value: "http"
+      - key: YOUTUBE_BGUTIL_HOSTPORT
+        fromService:
+          type: pserv
+          name: tg-x-bot-bgutil
+          property: hostport
+  - type: pserv
+    name: tg-x-bot-bgutil
+    runtime: image
+    plan: starter
+    image:
+      url: docker.io/brainicism/bgutil-ytdlp-pot-provider:1.3.1

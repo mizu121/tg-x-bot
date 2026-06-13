@@ -100,6 +100,7 @@ YOUTUBE_FALLBACK_CLIENTS = _youtube_client_groups(
 )
 YOUTUBE_PO_PROVIDER = os.getenv("YOUTUBE_PO_PROVIDER", "none").strip().lower()
 YOUTUBE_BGUTIL_BASE_URL = os.getenv("YOUTUBE_BGUTIL_BASE_URL", "").strip()
+YOUTUBE_BGUTIL_HOSTPORT = os.getenv("YOUTUBE_BGUTIL_HOSTPORT", "").strip()
 YOUTUBE_BGUTIL_SERVER_HOME = os.getenv("YOUTUBE_BGUTIL_SERVER_HOME", "").strip()
 APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 APIFY_INSTAGRAM_ACTOR = os.getenv("APIFY_INSTAGRAM_ACTOR", "apify/instagram-scraper")
@@ -603,8 +604,11 @@ def _youtube_extractor_args(clients: list[str] | None = None) -> dict:
 
     if YOUTUBE_PO_PROVIDER == "http":
         args["youtubepot-bgutilhttp"] = {}
-        if YOUTUBE_BGUTIL_BASE_URL:
-            args["youtubepot-bgutilhttp"]["base_url"] = YOUTUBE_BGUTIL_BASE_URL
+        base_url = YOUTUBE_BGUTIL_BASE_URL
+        if not base_url and YOUTUBE_BGUTIL_HOSTPORT:
+            base_url = f"http://{YOUTUBE_BGUTIL_HOSTPORT}"
+        if base_url:
+            args["youtubepot-bgutilhttp"]["base_url"] = base_url
     elif YOUTUBE_PO_PROVIDER == "script":
         args["youtubepot-bgutilscript"] = {}
         if YOUTUBE_BGUTIL_SERVER_HOME:
@@ -1567,7 +1571,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Apify: {'configured' if APIFY_TOKEN else 'not configured'}",
         f"yt-dlp cookies: {'configured' if YTDLP_COOKIE_FILE else 'not configured'}",
         f"YouTube clients: {','.join(YOUTUBE_CLIENTS)}",
-        f"YouTube PO provider: {YOUTUBE_PO_PROVIDER}",
+        (
+            f"YouTube PO provider: {YOUTUBE_PO_PROVIDER}"
+            f"{' (private bgutil)' if YOUTUBE_BGUTIL_HOSTPORT else ''}"
+        ),
         (
             f"Video normalize: {'enabled' if TELEGRAM_SAFE_VIDEO_TRANSCODE else 'disabled'} "
             f"({VIDEO_TRANSCODE_MAX_WIDTH}x{VIDEO_TRANSCODE_MAX_HEIGHT}, {VIDEO_TRANSCODE_PRESET}, "

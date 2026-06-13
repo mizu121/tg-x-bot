@@ -42,7 +42,7 @@ The bot defaults are intentionally conservative:
 YouTube sometimes blocks cloud-hosted downloaders with "Sign in to confirm you're not a bot." Keep `yt-dlp` current first, then use these options only when needed:
 
 - `YTDLP_COOKIES_B64` can hold a base64-encoded Netscape cookie file in host secrets. This is cheap, but cookies expire and should not be committed.
-- `YOUTUBE_PO_PROVIDER=http` enables the installed bgutil PO-token plugin when a bgutil HTTP provider is reachable. Set `YOUTUBE_BGUTIL_BASE_URL` if it is not on the default local port.
+- `YOUTUBE_PO_PROVIDER=http` enables the installed bgutil PO-token plugin when a bgutil HTTP provider is reachable. On Render, the Blueprint runs a private `tg-x-bot-bgutil` provider service and passes its private `host:port` through `YOUTUBE_BGUTIL_HOSTPORT`.
 - `YOUTUBE_PO_PROVIDER=script` enables bgutil script mode when the provider files and Node.js/Deno are installed. Set `YOUTUBE_BGUTIL_SERVER_HOME`.
 
 Paid download APIs are usually wrappers around the same moving target, so they are the last resort rather than the first fix.
