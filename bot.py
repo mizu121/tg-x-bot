@@ -24,6 +24,8 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 DOWNLOAD_ROOT = Path(os.getenv("DOWNLOAD_DIR", "downloads"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "49"))
