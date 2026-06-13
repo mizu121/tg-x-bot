@@ -49,6 +49,8 @@ Paid download APIs are usually wrappers around the same moving target, so they a
 - `/status` shows uptime, disk, cleanup, and config limits without exposing tokens.
 - `/whoami` shows your Telegram chat/user ID for `ADMIN_CHAT_IDS`.
 - `/failures 10` shows recent failure logs for admins.
+- `/failures clear` clears stale failure logs for admins.
+- `/demo` previews the live progress HUD without downloading media.
 
 ## Local run
 

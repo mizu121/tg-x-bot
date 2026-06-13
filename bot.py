@@ -194,6 +194,19 @@ class ProgressMessage:
         if final_text:
             await self._edit(final_text)
 
+    async def delete(self) -> None:
+        self.done.set()
+        if self.task:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+        try:
+            await self.message.delete()
+        except TelegramError as exc:
+            logger.debug("Progress delete failed: %s", exc)
+
     async def _run(self) -> None:
         while not self.done.is_set():
             await asyncio.sleep(PROGRESS_INTERVAL_SECONDS)
@@ -407,6 +420,14 @@ def read_failures(limit: int = 5) -> list[dict]:
         except json.JSONDecodeError:
             failures.append({"ts": "unknown", "error": line[:240]})
     return failures
+
+
+def clear_failures() -> int:
+    if not FAILURE_LOG_PATH.exists():
+        return 0
+    count = len(FAILURE_LOG_PATH.read_text(encoding="utf-8").splitlines())
+    FAILURE_LOG_PATH.write_text("", encoding="utf-8")
+    return count
 
 
 def _format_bytes(size: int) -> str:
@@ -1037,7 +1058,7 @@ async def handle_instagram_url(update: Update, context: ContextTypes.DEFAULT_TYP
         for index, media in enumerate(media_items, start=1):
             media.label = f"{media.label} {index}/{total}" if total > 1 else media.label
         await process_and_send_media_items(update, context, media_items, progress)
-        await progress.finish(f"Done. Sent {total} Instagram item(s).")
+        await progress.delete()
         return
 
     await progress.finish("No downloadable Instagram media was found.")
@@ -1064,7 +1085,7 @@ async def handle_reels(update: Update, context: ContextTypes.DEFAULT_TYPE, usern
             break
 
     if sent:
-        await progress.finish(f"Done. Sent {sent} reel(s) from @{username}.")
+        await progress.delete()
     else:
         await progress.finish(f"No downloadable reels were found for @{username}.")
 
@@ -1106,7 +1127,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         else:
             await progress.set("Analyzing link with yt-dlp")
             await process_and_send_url(update, context, url, progress)
-            await progress.finish("Done.")
+            await progress.delete()
     except DownloadTooLargeError as exc:
         record_failure(update, text, exc, "download_size")
         await progress.finish(
@@ -1130,9 +1151,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text(
         "Send a YouTube, X/Twitter, TikTok, or Instagram link. "
-        "For Instagram reels, send @username 3 or !reels username 3.",
+        "For Instagram reels, send @username 3 or !reels username 3. "
+        "Use /demo to preview the progress HUD.",
         **_message_effect_kwargs(update),
     )
+
+
+async def demo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    status_message = await update.message.reply_text(
+        "Booting media pipeline...",
+        **_message_effect_kwargs(update),
+    )
+    progress = ProgressMessage(status_message, "Reading request")
+    await progress.start()
+    for step in (
+        "Reading Instagram post",
+        "Found Instagram album: 4 item(s)",
+        "Downloading slide 1/4",
+        "Downloading slide 2/4",
+        "Uploading album 4 item(s)",
+    ):
+        await asyncio.sleep(1.2)
+        await progress.set(step)
+    await asyncio.sleep(1.2)
+    await progress.finish("Demo complete. Real jobs remove this panel after upload.")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1172,6 +1216,14 @@ async def failures(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update):
         await update.message.reply_text(
             f"Set ADMIN_CHAT_IDS={_chat_id(update)} in the host env to enable failure-log access.",
+            **_message_effect_kwargs(update),
+        )
+        return
+
+    if context.args and context.args[0].lower() in {"clear", "reset"}:
+        removed = clear_failures()
+        await update.message.reply_text(
+            f"Cleared {removed} failure log entr{'y' if removed == 1 else 'ies'}.",
             **_message_effect_kwargs(update),
         )
         return
@@ -1221,6 +1273,7 @@ def main() -> None:
 
     application = Application.builder().token(token).build()
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("demo", demo))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("failures", failures))
     application.add_handler(CommandHandler("whoami", whoami))
