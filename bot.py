@@ -93,6 +93,11 @@ YTDLP_FORMAT = os.getenv(
     "YTDLP_FORMAT",
     "bv*[height<=720]+ba/b[height<=720]/best[height<=720]/best",
 )
+YTDLP_FALLBACK_FORMATS = [
+    selector.strip()
+    for selector in os.getenv("YTDLP_FALLBACK_FORMATS", "bv*+ba/b,best").split(",")
+    if selector.strip()
+]
 YTDLP_COOKIE_FILE = _prepare_cookie_file()
 YOUTUBE_CLIENTS = _csv_values(os.getenv("YOUTUBE_CLIENTS", "mweb,web_safari,android,web"))
 YOUTUBE_FALLBACK_CLIENTS = _youtube_client_groups(
@@ -609,20 +614,20 @@ def _trim_caption(text: str, limit: int = 3900) -> str:
     return f"{cleaned[: limit - 20].rstrip()}\n\n...[truncated]"
 
 
-def _youtube_extractor_args(clients: list[str] | None = None) -> dict:
+def _youtube_extractor_args(clients: list[str] | None = None, use_po_provider: bool = True) -> dict:
     args = {
         "instagram": {"direct": True},
         "youtube": {"player_client": clients or YOUTUBE_CLIENTS},
     }
 
-    if YOUTUBE_PO_PROVIDER == "http":
+    if use_po_provider and YOUTUBE_PO_PROVIDER == "http":
         args["youtubepot-bgutilhttp"] = {}
         base_url = YOUTUBE_BGUTIL_BASE_URL
         if not base_url and YOUTUBE_BGUTIL_HOSTPORT:
             base_url = f"http://{YOUTUBE_BGUTIL_HOSTPORT}"
         if base_url:
             args["youtubepot-bgutilhttp"]["base_url"] = base_url
-    elif YOUTUBE_PO_PROVIDER == "script":
+    elif use_po_provider and YOUTUBE_PO_PROVIDER == "script":
         args["youtubepot-bgutilscript"] = {}
         if YOUTUBE_BGUTIL_SERVER_HOME:
             args["youtubepot-bgutilscript"]["server_home"] = YOUTUBE_BGUTIL_SERVER_HOME
@@ -630,9 +635,14 @@ def _youtube_extractor_args(clients: list[str] | None = None) -> dict:
     return args
 
 
-def _build_ydl_opts(job_dir: Path, youtube_clients: list[str] | None = None) -> dict:
+def _build_ydl_opts(
+    job_dir: Path,
+    youtube_clients: list[str] | None = None,
+    format_selector: str | None = None,
+    use_po_provider: bool = True,
+) -> dict:
     opts = {
-        "format": YTDLP_FORMAT,
+        "format": format_selector or YTDLP_FORMAT,
         "format_sort": ["res:720", "ext:mp4:m4a"],
         "paths": {"home": str(job_dir)},
         "outtmpl": {"default": "%(extractor_key)s-%(id)s.%(ext)s"},
@@ -640,6 +650,7 @@ def _build_ydl_opts(job_dir: Path, youtube_clients: list[str] | None = None) -> 
         "prefer_ffmpeg": True,
         "keepvideo": False,
         "noplaylist": True,
+        "max_filesize": MAX_UPLOAD_BYTES,
         "cachedir": False,
         "quiet": True,
         "no_warnings": True,
@@ -653,7 +664,7 @@ def _build_ydl_opts(job_dir: Path, youtube_clients: list[str] | None = None) -> 
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
             )
         },
-        "extractor_args": _youtube_extractor_args(youtube_clients),
+        "extractor_args": _youtube_extractor_args(youtube_clients, use_po_provider),
     }
 
     if YTDLP_COOKIE_FILE:
@@ -707,6 +718,18 @@ def _youtube_client_attempts() -> list[list[str]]:
         if clients and clients not in attempts:
             attempts.append(clients)
     return attempts
+
+
+def _youtube_format_attempts() -> list[str]:
+    attempts = [YTDLP_FORMAT]
+    for selector in YTDLP_FALLBACK_FORMATS:
+        if selector not in attempts:
+            attempts.append(selector)
+    return attempts
+
+
+def _youtube_po_attempts() -> list[bool]:
+    return [True, False] if YOUTUBE_PO_PROVIDER != "none" else [False]
 
 
 def _caption_from_info(info: dict, file_path: Path) -> str:
@@ -1011,9 +1034,11 @@ def _download_with_ydlp(
     job_dir: Path,
     caption: str | None = None,
     youtube_clients: list[str] | None = None,
+    format_selector: str | None = None,
+    use_po_provider: bool = True,
 ) -> DownloadResult:
     job_dir.mkdir(parents=True, exist_ok=True)
-    with yt_dlp.YoutubeDL(_build_ydl_opts(job_dir, youtube_clients)) as ydl:
+    with yt_dlp.YoutubeDL(_build_ydl_opts(job_dir, youtube_clients, format_selector, use_po_provider)) as ydl:
         info = ydl.extract_info(url, download=True)
         if not isinstance(info, dict):
             raise ValueError("Could not read video metadata.")
@@ -1042,16 +1067,32 @@ def download_video(url: str, job_dir: Path, caption: str | None = None) -> Downl
         return _download_with_ydlp(url, job_dir, caption)
 
     last_error: yt_dlp.utils.DownloadError | None = None
-    for index, clients in enumerate(_youtube_client_attempts(), start=1):
-        attempt_dir = job_dir / f"youtube-attempt-{index}"
-        try:
-            if index > 1:
-                logger.info("Retrying YouTube download with clients=%s", ",".join(clients))
-            return _download_with_ydlp(url, attempt_dir, caption, clients)
-        except yt_dlp.utils.DownloadError as exc:
-            last_error = exc
-            if not _youtube_error_allows_fallback(exc):
-                raise
+    attempt_index = 0
+    for use_po_provider in _youtube_po_attempts():
+        for format_selector in _youtube_format_attempts():
+            for clients in _youtube_client_attempts():
+                attempt_index += 1
+                attempt_dir = job_dir / f"youtube-attempt-{attempt_index}"
+                try:
+                    if attempt_index > 1:
+                        logger.info(
+                            "Retrying YouTube download with clients=%s format=%s po=%s",
+                            ",".join(clients),
+                            format_selector,
+                            use_po_provider,
+                        )
+                    return _download_with_ydlp(
+                        url,
+                        attempt_dir,
+                        caption,
+                        clients,
+                        format_selector,
+                        use_po_provider,
+                    )
+                except yt_dlp.utils.DownloadError as exc:
+                    last_error = exc
+                    if not _youtube_error_allows_fallback(exc):
+                        raise
 
     if last_error:
         raise last_error
