@@ -8,6 +8,8 @@ services:
         sync: false
       - key: APIFY_TOKEN
         sync: false
+      - key: APIFY_MAX_CHARGE_USD
+        value: "0.05"
       - key: MAX_CONCURRENT_DOWNLOADS
         value: "1"
       - key: MAX_UPLOAD_MB

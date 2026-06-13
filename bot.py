@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlparse
@@ -50,6 +51,7 @@ YTDLP_FORMAT = os.getenv(
 YTDLP_COOKIE_FILE = os.getenv("YTDLP_COOKIE_FILE")
 APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 APIFY_INSTAGRAM_ACTOR = os.getenv("APIFY_INSTAGRAM_ACTOR", "apify/instagram-scraper")
+APIFY_MAX_CHARGE_USD = os.getenv("APIFY_MAX_CHARGE_USD")
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 USERNAME_RE = re.compile(r"^@(?P<username>[A-Za-z0-9_.]+)(?:\s+(?P<count>\d+))?$")
@@ -376,8 +378,21 @@ def fetch_instagram_items(direct_urls: Iterable[str], limit: int) -> list[dict]:
         "searchLimit": 1,
     }
     client = _apify_client()
-    run = client.actor(APIFY_INSTAGRAM_ACTOR).call(run_input=run_input)
-    return list(client.dataset(run["defaultDatasetId"]).iterate_items())
+    call_kwargs = {"run_input": run_input, "logger": None}
+    if APIFY_MAX_CHARGE_USD:
+        call_kwargs["max_total_charge_usd"] = Decimal(APIFY_MAX_CHARGE_USD)
+
+    run = client.actor(APIFY_INSTAGRAM_ACTOR).call(**call_kwargs)
+    if run is None:
+        raise RuntimeError("Apify actor did not return a run.")
+
+    dataset_id = getattr(run, "default_dataset_id", None)
+    if dataset_id is None and isinstance(run, dict):
+        dataset_id = run.get("defaultDatasetId")
+    if not dataset_id:
+        raise RuntimeError("Apify actor finished without a dataset.")
+
+    return list(client.dataset(dataset_id).iterate_items())
 
 
 def _first_url(data: dict, keys: Iterable[str]) -> str | None:

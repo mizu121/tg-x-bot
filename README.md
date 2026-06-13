@@ -9,6 +9,7 @@ Copy `.env.example` to `.env` locally or set the same variables in your host:
 ```sh
 BOT_TOKEN=your_telegram_bot_token
 APIFY_TOKEN=optional_apify_token_for_instagram_reels
+APIFY_MAX_CHARGE_USD=0.05
 ```
 
 Do not commit `.env`, cookie files, Telegram tokens, Apify tokens, or Instagram session cookies.
@@ -21,6 +22,7 @@ The bot defaults are intentionally conservative:
 - `MAX_UPLOAD_MB=49` avoids downloading files that Telegram is unlikely to accept.
 - `MAX_REELS_PER_REQUEST=5` keeps Apify usage bounded.
 - `DOWNLOAD_TTL_MINUTES=90` and `DOWNLOAD_MAX_TOTAL_MB=600` remove stale local media automatically.
+- `APIFY_MAX_CHARGE_USD=0.05` can cap the cost of one Instagram actor run.
 - `YTDLP_FORMAT` caps default downloads at 720p to reduce bandwidth, disk, and CPU while still allowing fallbacks.
 - Completed downloads are stored in a per-request temp folder and deleted after sending.
 
