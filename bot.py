@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import html
 import json
 import logging
 import mimetypes
@@ -20,7 +21,7 @@ import requests
 import yt_dlp
 from apify_client import ApifyClient
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InputMediaPhoto, InputMediaVideo, Update
 from telegram.constants import ChatAction
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -83,6 +84,7 @@ MAX_REELS_PER_REQUEST = int(os.getenv("MAX_REELS_PER_REQUEST", "5"))
 DOWNLOAD_TTL_MINUTES = int(os.getenv("DOWNLOAD_TTL_MINUTES", "90"))
 DOWNLOAD_MAX_TOTAL_MB = int(os.getenv("DOWNLOAD_MAX_TOTAL_MB", "600"))
 PROGRESS_INTERVAL_SECONDS = float(os.getenv("PROGRESS_INTERVAL_SECONDS", "2.5"))
+PROGRESS_FRAMES = tuple(os.getenv("PROGRESS_FRAMES", "|/-\\"))
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "90"))
 YTDLP_FORMAT = os.getenv(
     "YTDLP_FORMAT",
@@ -105,9 +107,27 @@ USERNAME_RE = re.compile(r"^@(?P<username>[A-Za-z0-9_.]+)(?:\s+(?P<count>\d+))?$
 REELS_RE = re.compile(r"^!reels\s+(?P<username>[A-Za-z0-9_.]+)(?:\s+(?P<count>\d+))?$", re.IGNORECASE)
 
 VIDEO_URL_KEYS = ("videoUrl", "videoUrlDownload", "video_url", "video", "downloadUrl")
-PHOTO_URL_KEYS = ("displayUrl", "imageUrl", "image_url", "image", "photoUrl", "thumbnailUrl")
-CHILD_POST_KEYS = ("childPosts", "children", "carouselMedia", "sidecarChildren", "media")
+PHOTO_URL_KEYS = (
+    "displayUrl",
+    "display_url",
+    "displaySrc",
+    "imageUrl",
+    "image_url",
+    "image",
+    "photoUrl",
+    "thumbnailUrl",
+    "thumbnail_src",
+)
+CHILD_POST_KEYS = (
+    "childPosts",
+    "children",
+    "carouselMedia",
+    "sidecarChildren",
+    "sidecar_to_children",
+    "media",
+)
 SAFE_QUERY_KEYS = {"v", "list", "t", "start", "end"}
+MAX_MEDIA_GROUP_ITEMS = 10
 
 download_slots = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
@@ -145,18 +165,22 @@ class ProgressMessage:
     def __init__(self, message, initial_step: str) -> None:
         self.message = message
         self.step = initial_step
+        self.history = [initial_step]
         self.started_at = time.time()
         self.done = asyncio.Event()
         self.task: asyncio.Task | None = None
-        self.last_text: str | None = None
+        self.last_text: tuple[str | None, str] | None = None
 
     async def start(self) -> None:
-        await self._edit(self._render())
+        await self._edit(self._render(), parse_mode="HTML")
         self.task = asyncio.create_task(self._run())
 
     async def set(self, step: str) -> None:
         self.step = step
-        await self._edit(self._render())
+        if not self.history or self.history[-1] != step:
+            self.history.append(step)
+            self.history = self.history[-5:]
+        await self._edit(self._render(), parse_mode="HTML")
 
     async def finish(self, final_text: str | None = None) -> None:
         self.done.set()
@@ -172,14 +196,15 @@ class ProgressMessage:
     async def _run(self) -> None:
         while not self.done.is_set():
             await asyncio.sleep(PROGRESS_INTERVAL_SECONDS)
-            await self._edit(self._render())
+            await self._edit(self._render(), parse_mode="HTML")
 
-    async def _edit(self, text: str) -> None:
-        if text == self.last_text:
+    async def _edit(self, text: str, parse_mode: str | None = None) -> None:
+        current = (parse_mode, text)
+        if current == self.last_text:
             return
-        self.last_text = text
+        self.last_text = current
         try:
-            await self.message.edit_text(text)
+            await self.message.edit_text(text, parse_mode=parse_mode, disable_web_page_preview=True)
         except BadRequest as exc:
             if "Message is not modified" not in str(exc):
                 logger.debug("Progress edit failed: %s", exc)
@@ -188,8 +213,32 @@ class ProgressMessage:
 
     def _render(self) -> str:
         elapsed = max(1, int(time.time() - self.started_at))
-        dots = "." * ((elapsed % 3) + 1)
-        return f"{self.step}{dots}\n\nElapsed: {elapsed}s"
+        frame = PROGRESS_FRAMES[elapsed % len(PROGRESS_FRAMES)] if PROGRESS_FRAMES else "*"
+        width = 20
+        cursor = elapsed % (width * 2)
+        if cursor >= width:
+            cursor = (width * 2) - cursor - 1
+        bar = ["-"] * width
+        bar[cursor] = "#"
+        minutes, seconds = divmod(elapsed, 60)
+        trace = [f"> {self._clip(step, 30)}" for step in self.history[-4:]]
+        lines = [
+            "+------------------------------+",
+            "| TG-X MEDIA PIPELINE          |",
+            "+------------------------------+",
+            f"[{frame}] {self._clip(self.step, 26)}",
+            f"[{''.join(bar)}] {minutes:02d}:{seconds:02d}",
+            "",
+            *trace,
+        ]
+        return f"<pre>{html.escape(chr(10).join(lines))}</pre>"
+
+    @staticmethod
+    def _clip(value: str, limit: int) -> str:
+        cleaned = " ".join(value.split())
+        if len(cleaned) <= limit:
+            return cleaned
+        return f"{cleaned[: limit - 3].rstrip()}..."
 
 
 def _hostname(url: str) -> str:
@@ -646,9 +695,28 @@ def _first_url(data: dict, keys: Iterable[str]) -> str | None:
     return None
 
 
+def _nested_children(data: dict) -> list[dict]:
+    children = []
+    for key in CHILD_POST_KEYS:
+        value = data.get(key)
+        if isinstance(value, list):
+            children.extend(entry for entry in value if isinstance(entry, dict))
+        elif isinstance(value, dict):
+            edges = value.get("edges")
+            if isinstance(edges, list):
+                for edge in edges:
+                    node = edge.get("node") if isinstance(edge, dict) else None
+                    if isinstance(node, dict):
+                        children.append(node)
+            nested_media = value.get("media")
+            if isinstance(nested_media, list):
+                children.extend(entry for entry in nested_media if isinstance(entry, dict))
+    return children
+
+
 def _image_urls(data: dict) -> list[str]:
     urls = []
-    for key in ("images", "displayResources"):
+    for key in ("images", "displayResources", "display_resources"):
         value = data.get(key)
         if isinstance(value, list):
             for entry in value:
@@ -658,12 +726,27 @@ def _image_urls(data: dict) -> list[str]:
                     nested = _first_url(entry, ("url", "src", "uri", "displayUrl", "imageUrl"))
                     if nested:
                         urls.append(nested)
+    image_versions = data.get("image_versions2")
+    if isinstance(image_versions, dict):
+        candidates = image_versions.get("candidates")
+        if isinstance(candidates, list):
+            for entry in candidates:
+                if isinstance(entry, dict):
+                    nested = _first_url(entry, ("url", "src", "uri"))
+                    if nested:
+                        urls.append(nested)
     return urls
 
 
 def _media_from_single_item(data: dict, caption: str, label: str) -> list[MediaItem]:
     items = []
     video_url = _first_url(data, VIDEO_URL_KEYS)
+    if not video_url and isinstance(data.get("video_versions"), list):
+        for entry in data["video_versions"]:
+            if isinstance(entry, dict):
+                video_url = _first_url(entry, ("url", "src", "uri"))
+                if video_url:
+                    break
     if video_url:
         items.append(MediaItem(url=video_url, kind="video", caption=caption, label=label))
         return items
@@ -679,12 +762,7 @@ def _media_from_single_item(data: dict, caption: str, label: str) -> list[MediaI
 
 
 def media_items_from_apify_item(item: dict, prefix: str = "Instagram media") -> list[MediaItem]:
-    children = []
-    for key in CHILD_POST_KEYS:
-        value = item.get(key)
-        if isinstance(value, list):
-            children.extend(entry for entry in value if isinstance(entry, dict))
-
+    children = _nested_children(item)
     base_caption = _caption_from_apify_item(item, prefix)
     raw_items = []
     if children:
@@ -777,28 +855,83 @@ async def send_download(context: ContextTypes.DEFAULT_TYPE, chat_id: int, result
         await context.bot.send_document(chat_id=chat_id, document=media_file, caption=caption[:1024])
 
 
+def _can_send_in_media_group(result: DownloadResult) -> bool:
+    return result.kind in {"photo", "video"} and result.file_path.stat().st_size <= SEND_AS_DOCUMENT_BYTES
+
+
+async def send_media_group(context: ContextTypes.DEFAULT_TYPE, chat_id: int, results: list[DownloadResult]) -> bool:
+    if len(results) < 2 or not all(_can_send_in_media_group(result) for result in results):
+        return False
+
+    sent_any = False
+    for chunk_start in range(0, len(results), MAX_MEDIA_GROUP_ITEMS):
+        chunk = results[chunk_start : chunk_start + MAX_MEDIA_GROUP_ITEMS]
+        files = []
+        media = []
+        try:
+            for index, result in enumerate(chunk):
+                media_file = result.file_path.open("rb")
+                files.append(media_file)
+                caption = _result_caption(result)[:1024] if index == 0 else None
+                if result.kind == "photo":
+                    media.append(InputMediaPhoto(media=media_file, caption=caption))
+                else:
+                    media.append(InputMediaVideo(media=media_file, caption=caption, supports_streaming=True))
+            await context.bot.send_media_group(chat_id=chat_id, media=media)
+            sent_any = True
+        except TelegramError as exc:
+            logger.info("Media group upload failed: %s", exc)
+            if sent_any:
+                raise
+            return False
+        finally:
+            for media_file in files:
+                media_file.close()
+
+    return True
+
+
+async def process_and_send_media_items(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    items: list[MediaItem],
+    progress: ProgressMessage,
+) -> None:
+    if not update.message or not items:
+        return
+
+    chat_id = update.message.chat_id
+    job_dir = Path(tempfile.mkdtemp(prefix="job-", dir=DOWNLOAD_ROOT))
+    results: list[DownloadResult] = []
+    try:
+        async with download_slots:
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+            for index, item in enumerate(items, start=1):
+                item_dir = job_dir / f"item-{index}"
+                await progress.set(f"Downloading {item.label}")
+                results.append(await asyncio.to_thread(download_media_item, item, item_dir))
+
+        if len(results) > 1:
+            await progress.set(f"Uploading album {len(results)} item(s)")
+            if await send_media_group(context, chat_id, results):
+                return
+
+        for index, result in enumerate(results, start=1):
+            suffix = f" {index}/{len(results)}" if len(results) > 1 else ""
+            await progress.set(f"Uploading media{suffix}")
+            await send_download(context, chat_id, result)
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        await asyncio.to_thread(cleanup_downloads)
+
+
 async def process_and_send_media_item(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     item: MediaItem,
     progress: ProgressMessage,
 ) -> None:
-    if not update.message:
-        return
-
-    chat_id = update.message.chat_id
-    job_dir = Path(tempfile.mkdtemp(prefix="job-", dir=DOWNLOAD_ROOT))
-    try:
-        await progress.set(f"Downloading {item.label}")
-        async with download_slots:
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
-            result = await asyncio.to_thread(download_media_item, item, job_dir)
-
-        await progress.set(f"Uploading {item.label}")
-        await send_download(context, chat_id, result)
-    finally:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        await asyncio.to_thread(cleanup_downloads)
+    await process_and_send_media_items(update, context, [item], progress)
 
 
 async def process_and_send_url(
@@ -821,7 +954,7 @@ async def handle_instagram_url(update: Update, context: ContextTypes.DEFAULT_TYP
         await process_and_send_url(update, context, url, progress)
         return
 
-    await progress.set("Reading Instagram post with Apify")
+    await progress.set("Reading Instagram post")
     items = await asyncio.to_thread(fetch_instagram_items, [url], 1)
     for item in items:
         media_items = media_items_from_apify_item(item)
@@ -830,10 +963,10 @@ async def handle_instagram_url(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
         total = len(media_items)
-        await progress.set(f"Found {total} Instagram item(s)")
+        await progress.set(f"Found Instagram album: {total} item(s)" if total > 1 else "Found Instagram media")
         for index, media in enumerate(media_items, start=1):
             media.label = f"{media.label} {index}/{total}" if total > 1 else media.label
-            await process_and_send_media_item(update, context, media, progress)
+        await process_and_send_media_items(update, context, media_items, progress)
         await progress.finish(f"Done. Sent {total} Instagram item(s).")
         return
 
@@ -875,7 +1008,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         logger.info("Cleaned %s stale download files", cleanup["removed_count"])
 
     text = update.message.text.strip()
-    status_message = await update.message.reply_text("Starting...")
+    status_message = await update.message.reply_text("Booting media pipeline...")
     progress = ProgressMessage(status_message, "Reading request")
     await progress.start()
 
@@ -903,7 +1036,10 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await progress.finish("Done.")
     except DownloadTooLargeError as exc:
         record_failure(update, text, exc, "download_size")
-        await progress.finish(f"File is too large for this bot config: {exc}")
+        await progress.finish(
+            f"File is too large for Telegram Bot API upload. {exc}\n\n"
+            "I keep the limit just under 50 MB because Telegram cloud bots reject larger uploads."
+        )
     except MissingConfigError as exc:
         record_failure(update, text, exc, "config")
         await progress.finish(str(exc))
@@ -942,7 +1078,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Disk free: {_format_bytes(disk.free)} / {_format_bytes(disk.total)}",
         f"Download cache: {_format_bytes(download_size)}",
         f"Cleanup removed: {cleanup['removed_count']} file(s), {_format_bytes(cleanup['removed_bytes'])}",
-        f"Max upload: {MAX_UPLOAD_MB} MB",
+        f"Max upload: {MAX_UPLOAD_MB} MB (Telegram cloud cap: 50 MB)",
         f"Max concurrent downloads: {MAX_CONCURRENT_DOWNLOADS}",
         f"Max reels/request: {MAX_REELS_PER_REQUEST}",
         f"Apify: {'configured' if APIFY_TOKEN else 'not configured'}",

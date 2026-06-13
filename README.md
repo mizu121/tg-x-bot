@@ -26,6 +26,8 @@ The bot defaults are intentionally conservative:
 - `APIFY_MAX_CHARGE_USD=0.05` can cap the cost of one Instagram actor run.
 - `YTDLP_FORMAT` caps default downloads at 720p to reduce bandwidth, disk, and CPU while still allowing fallbacks.
 - `YOUTUBE_CLIENTS` and `YOUTUBE_FALLBACK_CLIENTS` try multiple yt-dlp YouTube clients before giving up.
+- Instagram carousel posts are downloaded as one batch and sent as Telegram albums when the media fits Telegram's album/upload rules.
+- Progress messages use a monospaced terminal-style live panel and are edited in place.
 - Completed downloads are stored in a per-request temp folder and deleted after sending.
 - Failed requests are written to `FAILURE_LOG_PATH` as JSONL and to stdout for host logs.
 - `LOG_FULL_URLS=false` keeps failure logs sanitized by default.
