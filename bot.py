@@ -89,6 +89,10 @@ DOWNLOAD_MAX_TOTAL_MB = int(os.getenv("DOWNLOAD_MAX_TOTAL_MB", "600"))
 PROGRESS_INTERVAL_SECONDS = float(os.getenv("PROGRESS_INTERVAL_SECONDS", "0.9"))
 PROGRESS_FRAMES = tuple(os.getenv("PROGRESS_FRAMES", ">>>>>-----"))
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "90"))
+TELEGRAM_CONNECT_TIMEOUT_SECONDS = float(os.getenv("TELEGRAM_CONNECT_TIMEOUT_SECONDS", "30"))
+TELEGRAM_READ_TIMEOUT_SECONDS = float(os.getenv("TELEGRAM_READ_TIMEOUT_SECONDS", "180"))
+TELEGRAM_WRITE_TIMEOUT_SECONDS = float(os.getenv("TELEGRAM_WRITE_TIMEOUT_SECONDS", "300"))
+TELEGRAM_POOL_TIMEOUT_SECONDS = float(os.getenv("TELEGRAM_POOL_TIMEOUT_SECONDS", "30"))
 YTDLP_FORMAT = os.getenv(
     "YTDLP_FORMAT",
     "bv*[height<=720]+ba/b[height<=720]/best[height<=720]/best",
@@ -1285,6 +1289,15 @@ def directory_size(path: Path) -> int:
     return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
 
 
+def _telegram_timeout_kwargs() -> dict[str, float]:
+    return {
+        "connect_timeout": TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+        "read_timeout": TELEGRAM_READ_TIMEOUT_SECONDS,
+        "write_timeout": TELEGRAM_WRITE_TIMEOUT_SECONDS,
+        "pool_timeout": TELEGRAM_POOL_TIMEOUT_SECONDS,
+    }
+
+
 async def send_download(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -1301,6 +1314,7 @@ async def send_download(
                     chat_id=chat_id,
                     photo=media_file,
                     caption=caption[:1024],
+                    **_telegram_timeout_kwargs(),
                     **effect_kwargs,
                 )
                 record_bot_messages(chat_id, sent_message)
@@ -1311,6 +1325,7 @@ async def send_download(
                     video=media_file,
                     caption=caption[:1024],
                     supports_streaming=True,
+                    **_telegram_timeout_kwargs(),
                     **effect_kwargs,
                 )
                 record_bot_messages(chat_id, sent_message)
@@ -1323,6 +1338,7 @@ async def send_download(
             chat_id=chat_id,
             document=media_file,
             caption=caption[:1024],
+            **_telegram_timeout_kwargs(),
             **effect_kwargs,
         )
         record_bot_messages(chat_id, sent_message)
@@ -1364,7 +1380,12 @@ async def send_media_group(
                 else:
                     media.append(InputMediaVideo(media=media_file, caption=caption, supports_streaming=True))
             effect_kwargs = {"message_effect_id": message_effect_id} if message_effect_id else {}
-            sent_messages = await context.bot.send_media_group(chat_id=chat_id, media=media, **effect_kwargs)
+            sent_messages = await context.bot.send_media_group(
+                chat_id=chat_id,
+                media=media,
+                **_telegram_timeout_kwargs(),
+                **effect_kwargs,
+            )
             record_bot_messages(chat_id, sent_messages)
             sent_any = True
         except TelegramError as exc:
@@ -1578,6 +1599,12 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 )
             else:
                 await progress.finish("Could not download that link. It may be private, blocked, age-gated, or need cookies.")
+        except TelegramError as exc:
+            record_failure(update, text, exc, "telegram_upload")
+            await progress.finish(
+                "I downloaded the media, but Telegram upload failed or timed out. "
+                "Retry once; if it repeats, the file may be too large or Telegram may be slow from this host."
+            )
         except Exception as exc:
             record_failure(update, text, exc, "unexpected")
             logger.exception("Unexpected error while handling request")
@@ -1648,6 +1675,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Max upload: {MAX_UPLOAD_MB} MB (Telegram cloud cap: 50 MB)",
         f"Max concurrent downloads: {MAX_CONCURRENT_DOWNLOADS}",
         f"Max reels/request: {MAX_REELS_PER_REQUEST}",
+        f"Telegram upload timeout: {TELEGRAM_WRITE_TIMEOUT_SECONDS:g}s write / {TELEGRAM_READ_TIMEOUT_SECONDS:g}s read",
         f"Apify: {'configured' if APIFY_TOKEN else 'not configured'}",
         f"yt-dlp cookies: {'configured' if YTDLP_COOKIE_FILE else 'not configured'}",
         f"YouTube clients: {','.join(YOUTUBE_CLIENTS)}",
